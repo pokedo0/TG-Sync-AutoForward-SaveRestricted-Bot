@@ -228,7 +228,10 @@ class Forwarder:
                 with tempfile.TemporaryDirectory() as tmpdir:
                     path = await self._download_media_to_path(msg, tmpdir)
                     if path:
-                        send_kwargs = self._build_send_file_kwargs(msg, reply_to)
+                        thumb_path = await self._download_video_thumb_to_path(msg, tmpdir)
+                        send_kwargs = self._build_send_file_kwargs(
+                            msg, reply_to, thumb_path=thumb_path
+                        )
                         result = await self.bot.send_file(target_chat_id, path, **send_kwargs)
                         return result.id if result else None
                     else:
@@ -410,7 +413,19 @@ class Forwarder:
         attrs = getattr(document, "attributes", None)
         return attrs or None
 
-    def _build_send_file_kwargs(self, msg: Message, reply_to: int | None) -> dict:
+    @staticmethod
+    def _has_document_thumbs(msg: Message) -> bool:
+        media = getattr(msg, "media", None)
+        if not isinstance(media, MessageMediaDocument):
+            return False
+        document = getattr(media, "document", None)
+        if not document:
+            return False
+        thumbs = getattr(document, "thumbs", None) or []
+        return bool(thumbs)
+
+    def _build_send_file_kwargs(self, msg: Message, reply_to: int | None,
+                                thumb_path: str | None = None) -> dict:
         kwargs = {
             "caption": msg.text or "",
             "reply_to": reply_to,
@@ -422,6 +437,8 @@ class Forwarder:
             attrs = self._get_document_attributes(msg)
             if attrs:
                 kwargs["attributes"] = attrs
+            if thumb_path:
+                kwargs["thumb"] = thumb_path
         return kwargs
 
     def _build_download_target_path(self, msg: Message, tmpdir: str) -> str:
@@ -446,3 +463,22 @@ class Forwarder:
             )
         except TypeError:
             return await self.userbot.download_media(msg, file=path)
+
+    async def _download_video_thumb_to_path(self, msg: Message, tmpdir: str) -> str | None:
+        if not self._is_video_message(msg):
+            return None
+        if not self._has_document_thumbs(msg):
+            return None
+        thumb_base = os.path.join(tmpdir, f"{msg.id}_thumb")
+        try:
+            return await self.userbot.download_media(
+                msg, file=thumb_base, thumb=-1, part_size_kb=self.download_part_size_kb
+            )
+        except TypeError:
+            try:
+                return await self.userbot.download_media(msg, file=thumb_base, thumb=-1)
+            except TypeError:
+                return None
+        except Exception as e:
+            logger.info("策略3: msg=%s 缩略图下载失败: %s", getattr(msg, "id", "?"), e)
+            return None

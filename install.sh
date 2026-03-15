@@ -32,7 +32,11 @@ if ! command -v python3 &> /dev/null; then
     exit 1
 fi
 
-python3 -m venv venv
+if [ ! -d "venv" ]; then
+    python3 -m venv venv
+else
+    echo "✅ 发现已有的 venv，跳过创建..."
+fi
 # 激活环境
 source venv/bin/activate
 
