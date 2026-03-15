@@ -26,6 +26,17 @@ class MonitorManager:
         self._handlers: dict[int, callable] = {}
         self._album_buffers: dict[tuple[int, int], dict] = {}
 
+    def _new_album_buffer(self, source_chat_id: int, target_chat_id: int,
+                          mode: str, target_topic_id: int | None) -> dict:
+        return {
+            "msgs": [],
+            "flush_task": None,
+            "source_chat_id": source_chat_id,
+            "target_chat_id": target_chat_id,
+            "mode": mode,
+            "target_topic_id": target_topic_id,
+        }
+
     async def _forward_and_save(self, task_id: int, source_chat_id: int, source_msg_id: int,
                                 target_chat_id: int, mode: str,
                                 target_topic_id: int | None):
@@ -80,14 +91,8 @@ class MonitorManager:
                     key = (task_id, grouped_id)
                     buffer = self._album_buffers.get(key)
                     if not buffer:
-                        buffer = {
-                            "msgs": [],
-                            "flush_task": None,
-                            "source_chat_id": source_chat_id,
-                            "target_chat_id": target_chat_id,
-                            "mode": mode,
-                            "target_topic_id": target_topic_id,
-                        }
+                        buffer = self._new_album_buffer(
+                            source_chat_id, target_chat_id, mode, target_topic_id)
                         self._album_buffers[key] = buffer
                     if all(m.id != event.message.id for m in buffer["msgs"]):
                         buffer["msgs"].append(event.message)

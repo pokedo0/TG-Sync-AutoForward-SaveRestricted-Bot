@@ -2,10 +2,16 @@
 import asyncio
 import logging
 import re
+from dataclasses import dataclass
 
 from telethon import TelegramClient, events, errors, Button
 
-from bot.link_parser import parse_link, resolve_chat_id, resolve_linked_chat
+from bot.link_parser import (
+    ParsedLink,
+    parse_link,
+    resolve_chat_id,
+    resolve_linked_chat,
+)
 from bot.telegram_utils import (
     resolve_chat_name, resolve_topic_name, describe_source,
     get_target_topic_id, build_source_link, truncate,
@@ -16,6 +22,7 @@ from core.message_logic import (
 )
 from core.syncer import Syncer
 from core.monitor import MonitorManager
+from core.rate_limiter import _get_dynamic_rate_limit
 from db.database import Database
 from db import models
 
@@ -26,6 +33,19 @@ _TG_LINK_RE = re.compile(r"https?://t\.me/\S+")
 _STATUS_EMOJI = {
     "running": "🟢", "paused": "⏸", "completed": "✅", "failed": "❌"
 }
+
+
+@dataclass
+class ParsedSource:
+    parsed: ParsedLink
+    source_id: int
+    mode: str
+
+
+@dataclass
+class FetchTarget:
+    chat_id: int
+    msg_id: int
 
 
 def register_handlers(bot: TelegramClient, userbot: TelegramClient,
@@ -44,15 +64,19 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
     # 内部共享 helpers
     # ------------------------------------------------------------------
 
-    async def _parse_source(event) -> tuple | None:
-        """从命令消息中解析链接并返回 (parsed, source_id, mode)，失败返回 None。"""
+    def _extract_tg_link(text: str) -> str | None:
+        match = _TG_LINK_RE.search(text)
+        return match.group() if match else None
+
+    async def _parse_source(event) -> ParsedSource | None:
+        """从命令消息中解析链接并返回 ParsedSource。"""
         text = event.raw_text
         mode = "forward" if "--forward" in text else "copy"
-        link_match = _TG_LINK_RE.search(text)
-        if not link_match:
+        link = _extract_tg_link(text)
+        if not link:
             await event.reply("❌ 请提供有效的 Telegram 链接")
             return None
-        parsed = parse_link(link_match.group())
+        parsed = parse_link(link)
         if not parsed:
             await event.reply("❌ 无法解析链接")
             return None
@@ -60,7 +84,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         if not source_id:
             await event.reply("❌ 无法访问源频道/群组")
             return None
-        return parsed, source_id, mode
+        return ParsedSource(parsed=parsed, source_id=source_id, mode=mode)
 
     async def _format_target_topic(target_chat_id: int,
                                    target_topic_id: int | None) -> str:
@@ -102,6 +126,49 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         buttons.append([Button.inline("🗑 清空所有任务", data="clear_all")])
         return buttons
 
+    async def _resolve_private_fetch_target(parsed: ParsedLink,
+                                            source_id: int) -> FetchTarget | None:
+        """将私聊解析的 parsed link 解析为真实抓取 chat/msg。"""
+        fetch_chat_id = source_id
+        target_msg_id = parsed.msg_id
+        if parsed.comment_id:
+            linked_id = await resolve_linked_chat(userbot, source_id)
+            if not linked_id:
+                return None
+            fetch_chat_id = linked_id
+            target_msg_id = parsed.comment_id
+            logger.info("评论链接 → 讨论群 %s 消息 %s", fetch_chat_id, parsed.comment_id)
+        return FetchTarget(chat_id=fetch_chat_id, msg_id=target_msg_id)
+
+    async def _forward_private_message(event, fetch_chat_id: int, msg,
+                                       parsed: ParsedLink):
+        """私聊链接解析后的统一转发逻辑。"""
+        kind = classify_message_kind(msg, single=parsed.single)
+        if kind == "album":
+            album_msgs = await collect_album_messages(
+                userbot, fetch_chat_id, msg, window=10)
+            logger.info("媒体集合: %d 条, grouped_id=%s",
+                        len(album_msgs), msg.grouped_id)
+            source_ids = [m.id for m in album_msgs]
+            target_ids = await forwarder.forward_album(
+                fetch_chat_id, source_ids, event.chat_id, mode="copy")
+            if not target_ids:
+                await event.reply("❌ 转发失败，已尝试所有策略")
+            return
+
+        if kind in ("media", "text"):
+            if kind == "media":
+                logger.info("单条媒体消息")
+            else:
+                logger.info("纯文本消息")
+            target_id = await forwarder.forward_message(
+                fetch_chat_id, msg.id, event.chat_id, mode="copy")
+            if not target_id:
+                await event.reply("❌ 转发失败，已尝试所有策略")
+            return
+
+        await event.reply("❌ 消息内容为空")
+
     # ------------------------------------------------------------------
     # 命令处理器
     # ------------------------------------------------------------------
@@ -141,7 +208,9 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         result = await _parse_source(event)
         if not result:
             return
-        parsed, source_id, mode = result
+        parsed = result.parsed
+        source_id = result.source_id
+        mode = result.mode
 
         target_chat_id = event.chat_id
         target_topic_id = get_target_topic_id(event)
@@ -152,7 +221,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             source_topic_id=parsed.topic_id,
             target_topic_id=target_topic_id)
 
-        rl = config.get("rate_limit", {})
+        rl = _get_dynamic_rate_limit(config)
         interval = rl.get("forward_interval", [2, 5])
         source_desc = await describe_source(userbot, source_id, parsed)
         topic_info = await _format_target_topic(target_chat_id, target_topic_id)
@@ -180,7 +249,9 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         result = await _parse_source(event)
         if not result:
             return
-        parsed, source_id, mode = result
+        parsed = result.parsed
+        source_id = result.source_id
+        mode = result.mode
 
         target_chat_id = event.chat_id
         target_topic_id = get_target_topic_id(event)
@@ -376,7 +447,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             await event.reply("⛔ 无权限")
             return
 
-        rl = config.get("rate_limit", {})
+        rl = _get_dynamic_rate_limit(config)
         await event.reply(
             "⚙️ 当前限流配置:\n"
             f"• batch_size: {rl.get('batch_size', 100)}\n"
@@ -394,11 +465,10 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         if not allow_public and not is_admin(event.sender_id):
             return
 
-        link_match = _TG_LINK_RE.search(event.raw_text)
-        if not link_match:
+        link = _extract_tg_link(event.raw_text)
+        if not link:
             return
 
-        link = link_match.group()
         parsed = parse_link(link)
         if not parsed or not parsed.msg_id:
             await event.reply("❌ 无法解析链接，需要包含消息ID")
@@ -417,51 +487,17 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
                     event.sender_id, source_desc, parsed.msg_id,
                     comment_info, single_info)
 
-        # 获取目标消息
-        fetch_chat_id = source_id
-        target_msg_id = parsed.msg_id
-        if parsed.comment_id:
-            linked_id = await resolve_linked_chat(userbot, source_id)
-            if linked_id:
-                fetch_chat_id = linked_id
-                target_msg_id = parsed.comment_id
-                logger.info("评论链接 → 讨论群 %s 消息 %s",
-                            fetch_chat_id, parsed.comment_id)
-            else:
-                await event.reply("❌ 无法获取频道的讨论群，评论消息无法解析")
-                return
+        fetch_target = await _resolve_private_fetch_target(parsed, source_id)
+        if not fetch_target:
+            await event.reply("❌ 无法获取频道的讨论群，评论消息无法解析")
+            return
         try:
-            msg = await userbot.get_messages(fetch_chat_id, ids=target_msg_id)
+            msg = await userbot.get_messages(fetch_target.chat_id, ids=fetch_target.msg_id)
             if not msg:
                 await event.reply("❌ 消息不存在")
                 return
 
-            # 统一消息类型判断（与 sync / monitor 共用）
-            kind = classify_message_kind(msg, single=parsed.single)
-            if kind == "album":
-                album_msgs = await collect_album_messages(
-                    userbot, fetch_chat_id, msg, window=10)
-                logger.info("媒体集合: %d 条, grouped_id=%s",
-                            len(album_msgs), msg.grouped_id)
-                source_ids = [m.id for m in album_msgs]
-                target_ids = await forwarder.forward_album(
-                    fetch_chat_id, source_ids, event.chat_id, mode="copy")
-                if not target_ids:
-                    await event.reply("❌ 转发失败，已尝试所有策略")
-            elif kind == "media":
-                logger.info("单条媒体消息")
-                target_id = await forwarder.forward_message(
-                    fetch_chat_id, msg.id, event.chat_id, mode="copy")
-                if not target_id:
-                    await event.reply("❌ 转发失败，已尝试所有策略")
-            elif kind == "text":
-                logger.info("纯文本消息")
-                target_id = await forwarder.forward_message(
-                    fetch_chat_id, msg.id, event.chat_id, mode="copy")
-                if not target_id:
-                    await event.reply("❌ 转发失败，已尝试所有策略")
-            else:
-                await event.reply("❌ 消息内容为空")
+            await _forward_private_message(event, fetch_target.chat_id, msg, parsed)
         except ValueError as e:
             if "input entity" in str(e):
                 await event.reply("❌ UserBot 未加入该私有频道/群组，无法访问")

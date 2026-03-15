@@ -35,7 +35,6 @@ class Syncer:
         self._cancel_flags[task_id] = False
         task = await models.get_task(self.db, task_id)
         offset_id = task["last_synced_msg_id"] if task else 0
-        batch_size = self.config.get("rate_limit", {}).get("batch_size", 100)
 
         async def _notify(text: str):
             if notify_chat_id:

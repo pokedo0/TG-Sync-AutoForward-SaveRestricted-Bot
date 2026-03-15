@@ -1,7 +1,6 @@
 """转发引擎：智能降级策略，选择最小成本的转发方式。"""
 import asyncio
 import logging
-import os
 import tempfile
 
 from telethon import TelegramClient, errors
