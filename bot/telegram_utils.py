@@ -8,7 +8,10 @@ from __future__ import annotations
 
 from telethon import TelegramClient
 from telethon.tl.types import Channel
-from telethon.tl.functions.channels import GetForumTopicsByIDRequest
+try:
+    from telethon.tl.functions.channels import GetForumTopicsByIDRequest
+except ImportError:
+    from telethon.tl.functions.messages import GetForumTopicsByIDRequest
 
 from bot.link_parser import ParsedLink
 
