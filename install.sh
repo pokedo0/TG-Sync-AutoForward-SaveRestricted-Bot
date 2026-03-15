@@ -5,7 +5,7 @@ set -e
 
 # 获取当前工作目录
 APP_DIR=$(pwd)
-SERVICE_NAME="TG-Sync-AutoForward-SaveRestricted-Bot"
+SERVICE_NAME="forward-bot"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 CURRENT_USER=$(whoami)
 
