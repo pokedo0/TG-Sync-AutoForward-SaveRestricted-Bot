@@ -1,10 +1,11 @@
 """转发引擎：智能降级策略，选择最小成本的转发方式。"""
 import asyncio
 import logging
+import os
 import tempfile
 
 from telethon import TelegramClient, errors
-from telethon.tl.types import Message
+from telethon.tl.types import DocumentAttributeVideo, Message, MessageMediaDocument
 
 from core.message_logic import is_file_media, normalize_messages
 from core.rate_limiter import RateLimiter
@@ -19,6 +20,17 @@ class Forwarder:
         self.userbot = userbot
         self.config = config
         self.rl = rate_limiter
+
+        transfer_cfg = (config or {}).get("transfer", {})
+        self.album_download_concurrency = max(
+            1, int(transfer_cfg.get("album_download_concurrency", 3))
+        )
+        self.upload_part_size_kb = self._clamp_part_size_kb(
+            transfer_cfg.get("upload_part_size_kb", 512)
+        )
+        self.download_part_size_kb = self._clamp_part_size_kb(
+            transfer_cfg.get("download_part_size_kb", 512)
+        )
 
     async def forward_message(self, source_chat_id: int, msg_id: int,
                               target_chat_id: int, mode: str = "copy",
@@ -214,12 +226,10 @@ class Forwarder:
 
             if is_file_media(msg):
                 with tempfile.TemporaryDirectory() as tmpdir:
-                    path = await self.userbot.download_media(msg, file=tmpdir)
+                    path = await self._download_media_to_path(msg, tmpdir)
                     if path:
-                        result = await self.bot.send_file(
-                            target_chat_id, path,
-                            caption=msg.text or "",
-                            reply_to=reply_to)
+                        send_kwargs = self._build_send_file_kwargs(msg, reply_to)
+                        result = await self.bot.send_file(target_chat_id, path, **send_kwargs)
                         return result.id if result else None
                     else:
                         logger.warning("策略3: msg=%s 媒体下载失败", msg_id)
@@ -254,18 +264,41 @@ class Forwarder:
                 return []
 
             with tempfile.TemporaryDirectory() as tmpdir:
-                files = []
-                captions = []
-                for m in media_msgs:
-                    path = await self.userbot.download_media(m, file=tmpdir)
+                sem = asyncio.Semaphore(self.album_download_concurrency)
+
+                async def _download_one(index: int, message: Message):
+                    async with sem:
+                        path = await self._download_media_to_path(message, tmpdir)
+                        return index, message, path
+
+                tasks = [
+                    asyncio.create_task(_download_one(idx, m))
+                    for idx, m in enumerate(media_msgs)
+                ]
+                downloaded = await asyncio.gather(*tasks, return_exceptions=True)
+
+                ok_items: list[tuple[int, Message, str]] = []
+                for item in downloaded:
+                    if isinstance(item, Exception):
+                        logger.warning("策略3相册: 并发下载异常: %s", item)
+                        continue
+                    index, message, path = item
                     if path:
-                        files.append(path)
-                        captions.append(m.text or "")
+                        ok_items.append((index, message, path))
+
+                ok_items.sort(key=lambda x: x[0])
+                files = [path for _, _, path in ok_items]
+                captions = [m.text or "" for _, m, _ in ok_items]
                 if not files:
                     logger.warning("策略3相册: 媒体下载失败")
                     return []
                 result = await self.bot.send_file(
-                    target_chat_id, files, caption=captions, reply_to=reply_to)
+                    target_chat_id,
+                    files,
+                    caption=captions,
+                    reply_to=reply_to,
+                    part_size_kb=self.upload_part_size_kb,
+                )
                 return self._extract_result_ids(result)
         except errors.FloodWaitError as e:
             return await self._handle_flood(
@@ -343,3 +376,73 @@ class Forwarder:
         self.rl.on_flood_wait()
         await asyncio.sleep(wait_seconds)
         return await retry_func(*args)
+
+    @staticmethod
+    def _clamp_part_size_kb(value) -> int:
+        try:
+            n = int(value)
+        except Exception:
+            n = 512
+        return max(32, min(512, n))
+
+    @staticmethod
+    def _is_video_message(msg: Message) -> bool:
+        media = getattr(msg, "media", None)
+        if not isinstance(media, MessageMediaDocument):
+            return False
+        document = getattr(media, "document", None)
+        if not document:
+            return False
+        attrs = getattr(document, "attributes", []) or []
+        if any(isinstance(a, DocumentAttributeVideo) for a in attrs):
+            return True
+        mime_type = getattr(document, "mime_type", "") or ""
+        return mime_type.startswith("video/")
+
+    @staticmethod
+    def _get_document_attributes(msg: Message):
+        media = getattr(msg, "media", None)
+        if not isinstance(media, MessageMediaDocument):
+            return None
+        document = getattr(media, "document", None)
+        if not document:
+            return None
+        attrs = getattr(document, "attributes", None)
+        return attrs or None
+
+    def _build_send_file_kwargs(self, msg: Message, reply_to: int | None) -> dict:
+        kwargs = {
+            "caption": msg.text or "",
+            "reply_to": reply_to,
+            "part_size_kb": self.upload_part_size_kb,
+        }
+        if self._is_video_message(msg):
+            # 让 Telegram 客户端按可流式视频处理，避免“必须完整下载后播放”。
+            kwargs["supports_streaming"] = True
+            attrs = self._get_document_attributes(msg)
+            if attrs:
+                kwargs["attributes"] = attrs
+        return kwargs
+
+    def _build_download_target_path(self, msg: Message, tmpdir: str) -> str:
+        file_obj = getattr(msg, "file", None)
+        ext = None
+        if file_obj:
+            file_name = getattr(file_obj, "name", None)
+            if file_name:
+                _, ext = os.path.splitext(file_name)
+            if not ext:
+                ext = getattr(file_obj, "ext", None)
+        if not ext:
+            ext = ".mp4" if self._is_video_message(msg) else ".bin"
+        return os.path.join(tmpdir, f"{msg.id}{ext}")
+
+    async def _download_media_to_path(self, msg: Message, tmpdir: str) -> str | None:
+        path = self._build_download_target_path(msg, tmpdir)
+        try:
+            # 兼容不同 Telethon 版本：部分版本不支持 download_media(part_size_kb=...)
+            return await self.userbot.download_media(
+                msg, file=path, part_size_kb=self.download_part_size_kb
+            )
+        except TypeError:
+            return await self.userbot.download_media(msg, file=path)

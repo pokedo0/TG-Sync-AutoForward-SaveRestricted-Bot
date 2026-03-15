@@ -21,5 +21,11 @@ rate_limit:
   flood_wait_multiplier: 2 # FloodWait后间隔翻倍系数
   max_flood_wait: 300 # 最大等待时间（秒），超过则暂停并通知
 
+# 传输性能调优（下载+上传链路）
+transfer:
+  album_download_concurrency: 3 # 相册并发下载数（建议 2-4）
+  upload_part_size_kb: 512 # 上传分片大小，范围 32-512
+  download_part_size_kb: 512 # 下载分片大小，范围 32-512（部分 Telethon 版本可能忽略）
+
 # 是否允许非管理员使用链接解析
 allow_public_resolve: true
