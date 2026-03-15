@@ -109,12 +109,13 @@ class Forwarder:
     async def _try_bot_direct(self, source_chat_id, msg_id,
                               target_chat_id, mode, topic_id) -> int | None:
         try:
+            source_ref = await self._resolve_source_for_bot(source_chat_id)
             if mode == "forward":
                 result = await self.bot.forward_messages(
-                    target_chat_id, msg_id, source_chat_id,
+                    target_chat_id, msg_id, source_ref,
                     **({"reply_to": topic_id} if topic_id else {}))
             else:
-                msgs = await self.bot.get_messages(source_chat_id, ids=msg_id)
+                msgs = await self.bot.get_messages(source_ref, ids=msg_id)
                 if not msgs:
                     logger.info("策略1: msg=%s Bot 无法获取消息", msg_id)
                     return None
@@ -137,12 +138,13 @@ class Forwarder:
     async def _try_bot_direct_album(self, source_chat_id, msg_ids,
                                     target_chat_id, mode, topic_id) -> list[int]:
         try:
+            source_ref = await self._resolve_source_for_bot(source_chat_id)
             if mode == "forward":
                 result = await self.bot.forward_messages(
-                    target_chat_id, msg_ids, source_chat_id,
+                    target_chat_id, msg_ids, source_ref,
                     **({"reply_to": topic_id} if topic_id else {}))
             else:
-                msgs = await self.bot.get_messages(source_chat_id, ids=msg_ids)
+                msgs = await self.bot.get_messages(source_ref, ids=msg_ids)
                 msgs = normalize_messages(msgs)
                 if not msgs:
                     logger.info("策略1相册: Bot 无法获取消息 %s", msg_ids)
@@ -482,3 +484,22 @@ class Forwarder:
         except Exception as e:
             logger.info("策略3: msg=%s 缩略图下载失败: %s", getattr(msg, "id", "?"), e)
             return None
+
+    async def _resolve_source_for_bot(self, source_chat_id):
+        try:
+            return await self.bot.get_input_entity(source_chat_id)
+        except Exception:
+            pass
+
+        try:
+            src = await self.userbot.get_entity(source_chat_id)
+        except Exception:
+            return source_chat_id
+
+        username = getattr(src, "username", None)
+        if username:
+            try:
+                return await self.bot.get_input_entity(username)
+            except Exception:
+                pass
+        return source_chat_id
