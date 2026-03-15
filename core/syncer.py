@@ -6,6 +6,7 @@ from telethon import TelegramClient, errors
 from telethon.tl.types import MessageService
 
 from core.forwarder import Forwarder
+from core.message_logic import build_forward_units
 from core.rate_limiter import RateLimiter
 from db.database import Database
 from db import models
@@ -46,8 +47,8 @@ class Syncer:
                      task_id, source_chat_id, source_topic_id, offset_id)
 
         total_forwarded = 0
-        # 收集所有消息 ID（从旧到新）
-        all_msg_ids = []
+        # 收集所有消息（从旧到新）
+        all_msgs = []
         try:
             async for msg in self.userbot.iter_messages(
                 source_chat_id, reverse=True, offset_id=offset_id,
@@ -57,7 +58,7 @@ class Syncer:
                 # 跳过系统消息（加人、建群、置顶等）
                 if isinstance(msg, MessageService):
                     continue
-                all_msg_ids.append(msg.id)
+                all_msgs.append(msg)
         except errors.FloodWaitError as e:
             logger.warning("同步任务 #%s 获取消息列表时 FloodWait %ds", task_id, e.seconds)
             await asyncio.sleep(e.seconds)
@@ -75,31 +76,44 @@ class Syncer:
             raise
 
         # topic 指定了但没获取到消息，可能 topic 已关闭
-        if source_topic_id and not all_msg_ids:
+        if source_topic_id and not all_msgs:
             logger.warning("同步任务 #%s topic=%s 无消息，可能已关闭", task_id, source_topic_id)
             await models.update_task_status(self.db, task_id, "failed")
             await _notify(f"❌ 同步任务 #{task_id} 失败: 话题#{source_topic_id} 无消息（可能已关闭或不存在）")
             return
 
-        total = len(all_msg_ids)
+        total = len(all_msgs)
         logger.info("同步任务 #%s 共获取 %d 条消息", task_id, total)
         await _notify(f"📋 开始同步，共 {total} 条消息")
 
-        # 逐条转发
-        for i, msg_id in enumerate(all_msg_ids):
+        # 组装统一转发单元（单条/相册）
+        units = build_forward_units(all_msgs)
+
+        # 逐单元转发
+        for kind, source_ids in units:
             if self._cancel_flags.get(task_id):
                 await models.update_task_status(self.db, task_id, "paused")
                 await _notify(f"⏸ 同步已暂停，已完成 {total_forwarded}/{total}")
                 return
 
-            target_msg_id = await self.forwarder.forward_message(
-                source_chat_id, msg_id, target_chat_id, mode, target_topic_id)
+            if kind == "album":
+                target_ids = await self.forwarder.forward_album(
+                    source_chat_id, source_ids, target_chat_id, mode, target_topic_id)
+                for src_id, tgt_id in zip(source_ids, target_ids):
+                    await models.save_message_map(self.db, task_id, src_id, tgt_id)
+                msg_count = len(source_ids)
+                last_msg_id = source_ids[-1]
+            else:
+                source_msg_id = source_ids[0]
+                target_msg_id = await self.forwarder.forward_message(
+                    source_chat_id, source_msg_id, target_chat_id, mode, target_topic_id)
+                if target_msg_id:
+                    await models.save_message_map(self.db, task_id, source_msg_id, target_msg_id)
+                msg_count = 1
+                last_msg_id = source_msg_id
 
-            if target_msg_id:
-                await models.save_message_map(self.db, task_id, msg_id, target_msg_id)
-
-            await models.update_last_synced(self.db, task_id, msg_id)
-            total_forwarded += 1
+            await models.update_last_synced(self.db, task_id, last_msg_id)
+            total_forwarded += msg_count
 
             # 每 100 条发送进度
             if total_forwarded % 100 == 0:

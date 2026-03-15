@@ -5,8 +5,9 @@ import os
 import tempfile
 
 from telethon import TelegramClient, errors
-from telethon.tl.types import Message, MessageMediaPhoto, MessageMediaDocument
+from telethon.tl.types import Message
 
+from core.message_logic import is_file_media, normalize_messages
 from core.rate_limiter import RateLimiter
 
 logger = logging.getLogger("tg_forward_bot.forwarder")
@@ -55,6 +56,45 @@ class Forwarder:
         return await self._send_fail_marker(source_chat_id, msg_id,
                                             target_chat_id, target_topic_id)
 
+    async def forward_album(self, source_chat_id: int, msg_ids: list[int],
+                            target_chat_id: int, mode: str = "copy",
+                            target_topic_id: int | None = None) -> list[int]:
+        """
+        转发相册（grouped media），尽量保持为同一组发送。
+        失败时降级为逐条转发。
+        """
+        if not msg_ids:
+            return []
+
+        msg_ids = sorted(set(msg_ids))
+        await self.rl.wait()
+
+        result = await self._try_bot_direct_album(
+            source_chat_id, msg_ids, target_chat_id, mode, target_topic_id)
+        if result:
+            logger.info("album=%s 策略1(Bot直接)成功 -> target_msgs=%s", msg_ids, result)
+            return result
+
+        result = await self._try_userbot_read_bot_forward_album(
+            source_chat_id, msg_ids, target_chat_id, mode, target_topic_id)
+        if result:
+            logger.info("album=%s 策略2(UserBot读+Bot写)成功 -> target_msgs=%s", msg_ids, result)
+            return result
+
+        result = await self._try_userbot_download_bot_upload_album(
+            source_chat_id, msg_ids, target_chat_id, target_topic_id)
+        if result:
+            logger.info("album=%s 策略3(下载+上传)成功 -> target_msgs=%s", msg_ids, result)
+            return result
+
+        forwarded: list[int] = []
+        for mid in msg_ids:
+            target_mid = await self.forward_message(
+                source_chat_id, mid, target_chat_id, mode, target_topic_id)
+            if target_mid:
+                forwarded.append(target_mid)
+        return forwarded
+
     async def _try_bot_direct(self, source_chat_id, msg_id,
                               target_chat_id, mode, topic_id) -> int | None:
         try:
@@ -83,6 +123,34 @@ class Forwarder:
             logger.warning("策略1: msg=%s Bot 异常: %s", msg_id, e)
             return None
 
+    async def _try_bot_direct_album(self, source_chat_id, msg_ids,
+                                    target_chat_id, mode, topic_id) -> list[int]:
+        try:
+            if mode == "forward":
+                result = await self.bot.forward_messages(
+                    target_chat_id, msg_ids, source_chat_id,
+                    **({"reply_to": topic_id} if topic_id else {}))
+            else:
+                msgs = await self.bot.get_messages(source_chat_id, ids=msg_ids)
+                msgs = normalize_messages(msgs)
+                if not msgs:
+                    logger.info("策略1相册: Bot 无法获取消息 %s", msg_ids)
+                    return []
+                result = await self._copy_album(self.bot, msgs, target_chat_id, topic_id)
+            return self._extract_result_ids(result)
+        except (errors.ChatForwardsRestrictedError,
+                errors.ChannelPrivateError,
+                errors.ChatAdminRequiredError) as e:
+            logger.info("策略1相册: Bot 无权限: %s", type(e).__name__)
+            return []
+        except errors.FloodWaitError as e:
+            return await self._handle_flood(
+                e, self._try_bot_direct_album,
+                source_chat_id, msg_ids, target_chat_id, mode, topic_id)
+        except Exception as e:
+            logger.warning("策略1相册: Bot 异常: %s", e)
+            return []
+
     async def _try_userbot_read_bot_forward(self, source_chat_id, msg_id,
                                             target_chat_id, mode, topic_id) -> int | None:
         try:
@@ -109,6 +177,32 @@ class Forwarder:
             logger.warning("策略2: msg=%s 异常: %s", msg_id, e)
             return None
 
+    async def _try_userbot_read_bot_forward_album(self, source_chat_id, msg_ids,
+                                                  target_chat_id, mode, topic_id) -> list[int]:
+        try:
+            msgs = await self.userbot.get_messages(source_chat_id, ids=msg_ids)
+            msgs = normalize_messages(msgs)
+            if not msgs:
+                logger.info("策略2相册: UserBot 无法获取消息 %s", msg_ids)
+                return []
+            if mode == "forward":
+                result = await self.userbot.forward_messages(
+                    target_chat_id, msg_ids, source_chat_id,
+                    **({"reply_to": topic_id} if topic_id else {}))
+            else:
+                result = await self._copy_album(self.bot, msgs, target_chat_id, topic_id)
+            return self._extract_result_ids(result)
+        except errors.ChatForwardsRestrictedError:
+            logger.info("策略2相册: 转发受限")
+            return []
+        except errors.FloodWaitError as e:
+            return await self._handle_flood(
+                e, self._try_userbot_read_bot_forward_album,
+                source_chat_id, msg_ids, target_chat_id, mode, topic_id)
+        except Exception as e:
+            logger.warning("策略2相册: 异常: %s", e)
+            return []
+
     async def _try_userbot_download_bot_upload(self, source_chat_id, msg_id,
                                                target_chat_id, topic_id) -> int | None:
         try:
@@ -119,7 +213,7 @@ class Forwarder:
 
             reply_to = topic_id if topic_id else None
 
-            if msg.media:
+            if is_file_media(msg):
                 with tempfile.TemporaryDirectory() as tmpdir:
                     path = await self.userbot.download_media(msg, file=tmpdir)
                     if path:
@@ -145,6 +239,43 @@ class Forwarder:
             logger.warning("策略3: msg=%s 异常: %s", msg_id, e)
             return None
 
+    async def _try_userbot_download_bot_upload_album(self, source_chat_id, msg_ids,
+                                                     target_chat_id, topic_id) -> list[int]:
+        try:
+            msgs = await self.userbot.get_messages(source_chat_id, ids=msg_ids)
+            msgs = normalize_messages(msgs)
+            if not msgs:
+                logger.info("策略3相册: UserBot 无法获取消息 %s", msg_ids)
+                return []
+
+            reply_to = topic_id if topic_id else None
+            media_msgs = [m for m in msgs if is_file_media(m)]
+            if not media_msgs:
+                logger.info("策略3相册: 无可下载媒体")
+                return []
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                files = []
+                captions = []
+                for m in media_msgs:
+                    path = await self.userbot.download_media(m, file=tmpdir)
+                    if path:
+                        files.append(path)
+                        captions.append(m.text or "")
+                if not files:
+                    logger.warning("策略3相册: 媒体下载失败")
+                    return []
+                result = await self.bot.send_file(
+                    target_chat_id, files, caption=captions, reply_to=reply_to)
+                return self._extract_result_ids(result)
+        except errors.FloodWaitError as e:
+            return await self._handle_flood(
+                e, self._try_userbot_download_bot_upload_album,
+                source_chat_id, msg_ids, target_chat_id, topic_id)
+        except Exception as e:
+            logger.warning("策略3相册: 异常: %s", e)
+            return []
+
     async def _send_fail_marker(self, source_chat_id, msg_id,
                                 target_chat_id, topic_id) -> int | None:
         try:
@@ -168,7 +299,7 @@ class Forwarder:
     async def _copy_message(self, client: TelegramClient, msg: Message,
                             target_chat_id: int, topic_id: int | None):
         reply_to = topic_id if topic_id else None
-        if msg.media:
+        if is_file_media(msg):
             return await client.send_file(
                 target_chat_id, msg.media,
                 caption=msg.text or "",
@@ -177,6 +308,31 @@ class Forwarder:
             return await client.send_message(
                 target_chat_id, msg.text, reply_to=reply_to)
         return None
+
+    async def _copy_album(self, client: TelegramClient, msgs: list[Message],
+                          target_chat_id: int, topic_id: int | None):
+        reply_to = topic_id if topic_id else None
+        media_msgs = [m for m in msgs if is_file_media(m)]
+        if not media_msgs:
+            return None
+        if len(media_msgs) == 1:
+            m = media_msgs[0]
+            return await client.send_file(
+                target_chat_id, m.media, caption=m.text or "", reply_to=reply_to)
+        files = [m.media for m in media_msgs]
+        captions = [m.text or "" for m in media_msgs]
+        return await client.send_file(
+            target_chat_id, files, caption=captions, reply_to=reply_to)
+
+    @staticmethod
+    def _extract_result_ids(result) -> list[int]:
+        if not result:
+            return []
+        if isinstance(result, list):
+            return [m.id for m in result if m]
+        if getattr(result, "id", None):
+            return [result.id]
+        return []
 
     async def _handle_flood(self, error: errors.FloodWaitError,
                             retry_func, *args):

@@ -2,7 +2,6 @@
 import asyncio
 import logging
 import re
-import tempfile
 
 from telethon import TelegramClient, events, errors, Button
 
@@ -10,6 +9,10 @@ from bot.link_parser import parse_link, resolve_chat_id, resolve_linked_chat
 from bot.telegram_utils import (
     resolve_chat_name, resolve_topic_name, describe_source,
     get_target_topic_id, build_source_link, truncate,
+)
+from core.message_logic import (
+    classify_message_kind,
+    collect_album_messages,
 )
 from core.syncer import Syncer
 from core.monitor import MonitorManager
@@ -31,6 +34,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
     admin_ids = set(config.get("admin_ids", []))
     allow_public = config.get("allow_public_resolve", False)
     syncer = Syncer(bot, userbot, db, config)
+    forwarder = monitor_manager.forwarder
     _sync_tasks: dict[int, asyncio.Task] = {}
 
     def is_admin(user_id: int) -> bool:
@@ -432,26 +436,30 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
                 await event.reply("❌ 消息不存在")
                 return
 
-            # 判断内容类型
-            if msg.grouped_id and not parsed.single:
-                search_ids = list(range(msg.id - 10, msg.id + 11))
-                nearby = await userbot.get_messages(
-                    fetch_chat_id, ids=search_ids)
-                album_msgs = sorted(
-                    [m for m in nearby
-                     if m and m.grouped_id == msg.grouped_id and m.media],
-                    key=lambda m: m.id)
+            # 统一消息类型判断（与 sync / monitor 共用）
+            kind = classify_message_kind(msg, single=parsed.single)
+            if kind == "album":
+                album_msgs = await collect_album_messages(
+                    userbot, fetch_chat_id, msg, window=10)
                 logger.info("媒体集合: %d 条, grouped_id=%s",
                             len(album_msgs), msg.grouped_id)
-                await _forward_msgs(event, fetch_chat_id, album_msgs,
-                                    is_private=True)
-            elif msg.media:
+                source_ids = [m.id for m in album_msgs]
+                target_ids = await forwarder.forward_album(
+                    fetch_chat_id, source_ids, event.chat_id, mode="copy")
+                if not target_ids:
+                    await event.reply("❌ 转发失败，已尝试所有策略")
+            elif kind == "media":
                 logger.info("单条媒体消息")
-                await _forward_msgs(event, fetch_chat_id, [msg],
-                                    is_private=True)
-            elif msg.text:
+                target_id = await forwarder.forward_message(
+                    fetch_chat_id, msg.id, event.chat_id, mode="copy")
+                if not target_id:
+                    await event.reply("❌ 转发失败，已尝试所有策略")
+            elif kind == "text":
                 logger.info("纯文本消息")
-                await bot.send_message(event.chat_id, msg.text)
+                target_id = await forwarder.forward_message(
+                    fetch_chat_id, msg.id, event.chat_id, mode="copy")
+                if not target_id:
+                    await event.reply("❌ 转发失败，已尝试所有策略")
             else:
                 await event.reply("❌ 消息内容为空")
         except ValueError as e:
@@ -465,49 +473,3 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         except Exception as e:
             logger.warning("私聊解析失败: %s", e)
             await event.reply(f"❌ 获取消息失败: {e}")
-
-    async def _forward_msgs(event, from_chat_id: int, msgs: list,
-                            is_private: bool = False):
-        """转发消息：优先 bot 直接转发，失败则下载再上传。"""
-        count = len(msgs)
-        msg_ids = [m.id for m in msgs]
-
-        # 策略1: bot 直接转发
-        try:
-            await bot.forward_messages(event.chat_id, msg_ids,
-                                       from_peer=from_chat_id)
-            logger.info("转发完成: bot直接转发 %d 条", count)
-            return
-        except Exception:
-            pass
-
-        # 策略2: userbot 转发（私聊跳过）
-        if not is_private:
-            try:
-                await userbot.forward_messages(event.chat_id, msg_ids,
-                                               from_peer=from_chat_id)
-                logger.info("转发完成: userbot转发 %d 条", count)
-                return
-            except Exception:
-                pass
-
-        # 策略3: userbot 下载 + bot 上传
-        logger.info("转发: 使用下载再上传, %d 条", count)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            files = []
-            captions = []
-            for m in msgs:
-                path = await userbot.download_media(m, file=tmpdir)
-                if path:
-                    files.append(path)
-                    captions.append(m.text or "")
-            if not files:
-                await event.reply("❌ 媒体下载失败")
-                return
-            if len(files) == 1:
-                await bot.send_file(event.chat_id, files[0],
-                                    caption=captions[0])
-            else:
-                await bot.send_file(event.chat_id, files,
-                                    caption=captions)
-            logger.info("转发完成: 下载再上传 %d 条", len(files))
