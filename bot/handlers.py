@@ -1,0 +1,513 @@
+"""Bot 命令处理器：注册所有 Telegram Bot 命令。"""
+import asyncio
+import logging
+import re
+import tempfile
+
+from telethon import TelegramClient, events, errors, Button
+
+from bot.link_parser import parse_link, resolve_chat_id, resolve_linked_chat
+from bot.telegram_utils import (
+    resolve_chat_name, resolve_topic_name, describe_source,
+    get_target_topic_id, build_source_link, truncate,
+)
+from core.syncer import Syncer
+from core.monitor import MonitorManager
+from db.database import Database
+from db import models
+
+logger = logging.getLogger("tg_forward_bot.handlers")
+
+_TG_LINK_RE = re.compile(r"https?://t\.me/\S+")
+
+_STATUS_EMOJI = {
+    "running": "🟢", "paused": "⏸", "completed": "✅", "failed": "❌"
+}
+
+
+def register_handlers(bot: TelegramClient, userbot: TelegramClient,
+                      db: Database, config: dict,
+                      monitor_manager: MonitorManager):
+    admin_ids = set(config.get("admin_ids", []))
+    allow_public = config.get("allow_public_resolve", False)
+    syncer = Syncer(bot, userbot, db, config)
+    _sync_tasks: dict[int, asyncio.Task] = {}
+
+    def is_admin(user_id: int) -> bool:
+        return user_id in admin_ids
+
+    # ------------------------------------------------------------------
+    # 内部共享 helpers
+    # ------------------------------------------------------------------
+
+    async def _parse_source(event) -> tuple | None:
+        """从命令消息中解析链接并返回 (parsed, source_id, mode)，失败返回 None。"""
+        text = event.raw_text
+        mode = "forward" if "--forward" in text else "copy"
+        link_match = _TG_LINK_RE.search(text)
+        if not link_match:
+            await event.reply("❌ 请提供有效的 Telegram 链接")
+            return None
+        parsed = parse_link(link_match.group())
+        if not parsed:
+            await event.reply("❌ 无法解析链接")
+            return None
+        source_id = await resolve_chat_id(userbot, parsed)
+        if not source_id:
+            await event.reply("❌ 无法访问源频道/群组")
+            return None
+        return parsed, source_id, mode
+
+    async def _format_target_topic(target_chat_id: int,
+                                   target_topic_id: int | None) -> str:
+        """格式化目标话题信息。"""
+        if not target_topic_id:
+            return ""
+        name = await resolve_topic_name(userbot, target_chat_id,
+                                        target_topic_id)
+        return f"\n📍 目标话题:「{name}」"
+
+    async def _stop_running_task(task: dict):
+        """停止一个运行中的任务（sync 或 monitor）。"""
+        tid = task["id"]
+        if task["type"] == "sync":
+            syncer.cancel(tid)
+            at = _sync_tasks.pop(tid, None)
+            if at:
+                at.cancel()
+        else:
+            await monitor_manager.stop_monitor(tid)
+
+    async def _build_task_buttons(tasks: list) -> list:
+        """为任务列表构建 inline button 行。"""
+        buttons = []
+        for t in tasks:
+            emoji = "🔄" if t["type"] == "sync" else "👁"
+            status = _STATUS_EMOJI.get(t["status"], "❓")
+            src_name = truncate(
+                await resolve_chat_name(userbot, t["source_chat_id"]), 20)
+            topic_part = ""
+            if t["source_topic_id"]:
+                topic_name = truncate(
+                    await resolve_topic_name(
+                        userbot, t["source_chat_id"], t["source_topic_id"]),
+                    12)
+                topic_part = f"/{topic_name}"
+            label = f"{status}{emoji} #{t['id']} {src_name}{topic_part}"
+            buttons.append([Button.inline(label, data=f"task:{t['id']}")])
+        buttons.append([Button.inline("🗑 清空所有任务", data="clear_all")])
+        return buttons
+
+    # ------------------------------------------------------------------
+    # 命令处理器
+    # ------------------------------------------------------------------
+
+    @bot.on(events.NewMessage(pattern=r"/start(?:@\w+)?$"))
+    async def on_start(event):
+        logger.info("收到 /start 命令 from user=%s chat=%s", event.sender_id, event.chat_id)
+        await event.reply(
+            "🤖 Telegram 转发 Bot\n\n"
+            "功能:\n"
+            "• 私聊发链接 → 解析受限内容\n"
+            "• /sync <链接> → 同步历史消息到当前群\n"
+            "• /monitor <链接> → 监控新消息转发到当前群\n"
+            "• /list → 管理所有任务\n"
+            "• /settings → 查看配置")
+
+    @bot.on(events.NewMessage(pattern=r"/help(?:@\w+)?$"))
+    async def on_help(event):
+        await event.reply(
+            "📖 使用说明:\n\n"
+            "/sync <链接> [--forward] — 同步源历史到当前群\n"
+            "/monitor <链接> [--forward] — 监控源新消息到当前群\n"
+            "/list — 管理所有任务（含暂停/恢复/删除）\n"
+            "/settings — 查看限流配置\n\n"
+            "链接格式:\n"
+            "• https://t.me/channel/123\n"
+            "• https://t.me/c/123456/789\n"
+            "• https://t.me/c/123456/3/962 (话题)")
+
+    @bot.on(events.NewMessage(pattern=r"/sync(?:@\w+)?\s+"))
+    async def on_sync(event):
+        logger.info("收到 /sync 命令 from user=%s chat=%s", event.sender_id, event.chat_id)
+        if not is_admin(event.sender_id):
+            await event.reply("⛔ 无权限")
+            return
+
+        result = await _parse_source(event)
+        if not result:
+            return
+        parsed, source_id, mode = result
+
+        target_chat_id = event.chat_id
+        target_topic_id = get_target_topic_id(event)
+        logger.info("创建同步任务: source=%s topic=%s -> target=%s target_topic=%s mode=%s",
+                     source_id, parsed.topic_id, target_chat_id, target_topic_id, mode)
+        task_id = await models.create_task(
+            db, "sync", source_id, target_chat_id, mode,
+            source_topic_id=parsed.topic_id,
+            target_topic_id=target_topic_id)
+
+        rl = config.get("rate_limit", {})
+        interval = rl.get("forward_interval", [2, 5])
+        source_desc = await describe_source(userbot, source_id, parsed)
+        topic_info = await _format_target_topic(target_chat_id, target_topic_id)
+        await event.reply(
+            f"🚀 同步任务 #{task_id} 已创建\n"
+            f"📌 源: {source_desc}\n"
+            f"⏱ 转发间隔: {interval[0]}-{interval[1]}秒/条\n"
+            f"📋 模式: {mode}{topic_info}")
+
+        task = asyncio.create_task(syncer.start_sync(
+            task_id, source_id, target_chat_id, mode,
+            source_topic_id=parsed.topic_id,
+            target_topic_id=target_topic_id,
+            notify_chat_id=event.chat_id,
+            notify_topic_id=target_topic_id))
+        _sync_tasks[task_id] = task
+
+    @bot.on(events.NewMessage(pattern=r"/monitor(?:@\w+)?\s+"))
+    async def on_monitor(event):
+        logger.info("收到 /monitor 命令 from user=%s chat=%s", event.sender_id, event.chat_id)
+        if not is_admin(event.sender_id):
+            await event.reply("⛔ 无权限")
+            return
+
+        result = await _parse_source(event)
+        if not result:
+            return
+        parsed, source_id, mode = result
+
+        target_chat_id = event.chat_id
+        target_topic_id = get_target_topic_id(event)
+        logger.info("创建监控任务: source=%s topic=%s -> target=%s target_topic=%s mode=%s",
+                     source_id, parsed.topic_id, target_chat_id, target_topic_id, mode)
+        task_id = await models.create_task(
+            db, "monitor", source_id, target_chat_id, mode,
+            source_topic_id=parsed.topic_id,
+            target_topic_id=target_topic_id)
+
+        await monitor_manager.start_monitor(
+            task_id, source_id, target_chat_id, mode,
+            source_topic_id=parsed.topic_id,
+            target_topic_id=target_topic_id)
+
+        source_desc = await describe_source(userbot, source_id, parsed)
+        topic_info = await _format_target_topic(target_chat_id, target_topic_id)
+        logger.info("监控任务 #%s 已启动", task_id)
+        await event.reply(
+            f"👁 监控任务 #{task_id} 已启动\n"
+            f"📌 源: {source_desc}\n"
+            f"📋 模式: {mode}{topic_info}")
+
+    @bot.on(events.NewMessage(pattern=r"/list(?:@\w+)?$"))
+    async def on_list(event):
+        if not is_admin(event.sender_id):
+            await event.reply("⛔ 无权限")
+            return
+
+        tasks = await models.get_all_active_tasks(db)
+        if not tasks:
+            await event.reply("📭 没有活跃的任务")
+            return
+
+        buttons = await _build_task_buttons(tasks)
+        await event.reply("📋 任务列表（点击管理）:", buttons=buttons)
+
+    async def _show_task_detail(event, task_id: int):
+        """渲染任务详情内联键盘（共享逻辑）。"""
+        t = await models.get_task(db, task_id)
+        if not t:
+            await event.answer("任务不存在", alert=True)
+            return
+
+        emoji = "🔄" if t["type"] == "sync" else "👁"
+        status = _STATUS_EMOJI.get(t["status"], "❓")
+
+        # 解析源名称
+        src_name = await resolve_chat_name(userbot, t["source_chat_id"])
+        src_topic = ""
+        if t["source_topic_id"]:
+            topic_name = await resolve_topic_name(
+                userbot, t["source_chat_id"], t["source_topic_id"])
+            src_topic = f" →「{topic_name}」"
+
+        # 解析目标名称
+        tgt_name = await resolve_chat_name(bot, t["target_chat_id"])
+        tgt_topic = ""
+        if t["target_topic_id"]:
+            topic_name = await resolve_topic_name(
+                userbot, t["target_chat_id"], t["target_topic_id"])
+            tgt_topic = f" →「{topic_name}」"
+
+        source_link = build_source_link(t["source_chat_id"],
+                                         t["source_topic_id"])
+
+        text = (
+            f"{emoji} 任务 #{t['id']}\n"
+            f"类型: {t['type']} | 模式: {t['mode']}\n"
+            f"状态: {status} {t['status']}\n"
+            f"源: {src_name}{src_topic}\n"
+            f"目标: {tgt_name}{tgt_topic}")
+
+        buttons = []
+        if source_link:
+            buttons.append([Button.url("🔗 打开源", source_link)])
+
+        action_row = []
+        if t["status"] == "running":
+            action_row.append(Button.inline("⏸ 暂停", data=f"pause:{task_id}"))
+        elif t["status"] in ("paused", "failed"):
+            if t["type"] == "monitor":
+                action_row.append(Button.inline("▶️ 恢复", data=f"resume:{task_id}"))
+        action_row.append(Button.inline("🗑 删除", data=f"delete:{task_id}"))
+        buttons.append(action_row)
+
+        buttons.append([Button.inline("« 返回列表", data="back_list")])
+        await event.edit(text, buttons=buttons)
+
+    @bot.on(events.CallbackQuery(pattern=rb"task:(\d+)"))
+    async def on_task_detail(event):
+        if not is_admin(event.sender_id):
+            await event.answer("⛔ 无权限", alert=True)
+            return
+        task_id = int(event.pattern_match.group(1))
+        await _show_task_detail(event, task_id)
+
+    @bot.on(events.CallbackQuery(pattern=rb"pause:(\d+)"))
+    async def on_pause(event):
+        if not is_admin(event.sender_id):
+            await event.answer("⛔ 无权限", alert=True)
+            return
+
+        task_id = int(event.pattern_match.group(1))
+        t = await models.get_task(db, task_id)
+        if not t:
+            await event.answer("任务不存在", alert=True)
+            return
+
+        if t["status"] == "running":
+            await _stop_running_task(t)
+        await models.update_task_status(db, task_id, "paused")
+        logger.info("任务 #%s 已暂停", task_id)
+        await event.answer(f"⏸ 任务 #{task_id} 已暂停")
+        await _show_task_detail(event, task_id)
+
+    @bot.on(events.CallbackQuery(pattern=rb"resume:(\d+)"))
+    async def on_resume(event):
+        if not is_admin(event.sender_id):
+            await event.answer("⛔ 无权限", alert=True)
+            return
+
+        task_id = int(event.pattern_match.group(1))
+        t = await models.get_task(db, task_id)
+        if not t or t["type"] != "monitor":
+            await event.answer("仅支持恢复监控任务", alert=True)
+            return
+
+        await models.update_task_status(db, task_id, "running")
+        await monitor_manager.start_monitor(
+            task_id, t["source_chat_id"], t["target_chat_id"],
+            t["mode"], t["source_topic_id"], t["target_topic_id"])
+
+        logger.info("监控任务 #%s 已恢复", task_id)
+        await event.answer(f"▶️ 监控任务 #{task_id} 已恢复")
+        await _show_task_detail(event, task_id)
+
+    @bot.on(events.CallbackQuery(pattern=rb"delete:(\d+)"))
+    async def on_delete(event):
+        if not is_admin(event.sender_id):
+            await event.answer("⛔ 无权限", alert=True)
+            return
+
+        task_id = int(event.pattern_match.group(1))
+        t = await models.get_task(db, task_id)
+        if not t:
+            await event.answer("任务不存在", alert=True)
+            return
+
+        if t["status"] == "running":
+            await _stop_running_task(t)
+
+        await models.update_task_status(db, task_id, "completed")
+        logger.info("任务 #%s 已删除", task_id)
+        await event.answer(f"🗑 任务 #{task_id} 已删除")
+        await _refresh_list(event)
+
+    @bot.on(events.CallbackQuery(pattern=rb"clear_all"))
+    async def on_clear_all(event):
+        if not is_admin(event.sender_id):
+            await event.answer("⛔ 无权限", alert=True)
+            return
+
+        tasks = await models.get_all_active_tasks(db)
+        for t in tasks:
+            if t["status"] == "running":
+                await _stop_running_task(t)
+            await models.update_task_status(db, t["id"], "completed")
+
+        logger.info("已清空所有任务，共 %d 个", len(tasks))
+        await event.answer(f"🗑 已清空 {len(tasks)} 个任务")
+        await event.edit("📭 所有任务已清空", buttons=None)
+
+    @bot.on(events.CallbackQuery(pattern=rb"back_list"))
+    async def on_back_list(event):
+        if not is_admin(event.sender_id):
+            await event.answer("⛔ 无权限", alert=True)
+            return
+        await _refresh_list(event)
+
+    async def _refresh_list(event):
+        """刷新任务列表内联键盘。"""
+        tasks = await models.get_all_active_tasks(db)
+        if not tasks:
+            await event.edit("📭 没有活跃的任务", buttons=None)
+            return
+        buttons = await _build_task_buttons(tasks)
+        await event.edit("📋 任务列表（点击管理）:", buttons=buttons)
+
+    @bot.on(events.NewMessage(pattern=r"/settings(?:@\w+)?$"))
+    async def on_settings(event):
+        if not is_admin(event.sender_id):
+            await event.reply("⛔ 无权限")
+            return
+
+        rl = config.get("rate_limit", {})
+        await event.reply(
+            "⚙️ 当前限流配置:\n"
+            f"• batch_size: {rl.get('batch_size', 100)}\n"
+            f"• forward_interval: {rl.get('forward_interval', [2, 5])}\n"
+            f"• batch_pause_every: {rl.get('batch_pause_every', 50)}\n"
+            f"• batch_pause_time: {rl.get('batch_pause_time', [30, 60])}\n"
+            f"• flood_wait_multiplier: {rl.get('flood_wait_multiplier', 2)}\n"
+            f"• max_flood_wait: {rl.get('max_flood_wait', 300)}")
+
+    @bot.on(events.NewMessage(func=lambda e: e.is_private))
+    async def on_private_link(event):
+        """私聊发链接，自动解析并返回内容。"""
+        if event.raw_text.startswith("/"):
+            return
+        if not allow_public and not is_admin(event.sender_id):
+            return
+
+        link_match = _TG_LINK_RE.search(event.raw_text)
+        if not link_match:
+            return
+
+        link = link_match.group()
+        parsed = parse_link(link)
+        if not parsed or not parsed.msg_id:
+            await event.reply("❌ 无法解析链接，需要包含消息ID")
+            return
+
+        source_id = await resolve_chat_id(userbot, parsed)
+        if not source_id:
+            await event.reply("❌ 无法访问该频道/群组")
+            return
+
+        # 获取源描述
+        source_desc = await describe_source(userbot, source_id, parsed)
+        comment_info = f" comment={parsed.comment_id}" if parsed.comment_id else ""
+        single_info = " [single]" if parsed.single else ""
+        logger.info("私聊解析: user=%s 源=%s msg=%s%s%s",
+                    event.sender_id, source_desc, parsed.msg_id,
+                    comment_info, single_info)
+
+        # 获取目标消息
+        fetch_chat_id = source_id
+        target_msg_id = parsed.msg_id
+        if parsed.comment_id:
+            linked_id = await resolve_linked_chat(userbot, source_id)
+            if linked_id:
+                fetch_chat_id = linked_id
+                target_msg_id = parsed.comment_id
+                logger.info("评论链接 → 讨论群 %s 消息 %s",
+                            fetch_chat_id, parsed.comment_id)
+            else:
+                await event.reply("❌ 无法获取频道的讨论群，评论消息无法解析")
+                return
+        try:
+            msg = await userbot.get_messages(fetch_chat_id, ids=target_msg_id)
+            if not msg:
+                await event.reply("❌ 消息不存在")
+                return
+
+            # 判断内容类型
+            if msg.grouped_id and not parsed.single:
+                search_ids = list(range(msg.id - 10, msg.id + 11))
+                nearby = await userbot.get_messages(
+                    fetch_chat_id, ids=search_ids)
+                album_msgs = sorted(
+                    [m for m in nearby
+                     if m and m.grouped_id == msg.grouped_id and m.media],
+                    key=lambda m: m.id)
+                logger.info("媒体集合: %d 条, grouped_id=%s",
+                            len(album_msgs), msg.grouped_id)
+                await _forward_msgs(event, fetch_chat_id, album_msgs,
+                                    is_private=True)
+            elif msg.media:
+                logger.info("单条媒体消息")
+                await _forward_msgs(event, fetch_chat_id, [msg],
+                                    is_private=True)
+            elif msg.text:
+                logger.info("纯文本消息")
+                await bot.send_message(event.chat_id, msg.text)
+            else:
+                await event.reply("❌ 消息内容为空")
+        except ValueError as e:
+            if "input entity" in str(e):
+                await event.reply("❌ UserBot 未加入该私有频道/群组，无法访问")
+            else:
+                await event.reply(f"❌ 获取消息失败: {e}")
+            logger.warning("私聊解析失败: %s", e)
+        except errors.ChannelPrivateError:
+            await event.reply("❌ 该频道/群组为私有，UserBot 未加入无法访问")
+        except Exception as e:
+            logger.warning("私聊解析失败: %s", e)
+            await event.reply(f"❌ 获取消息失败: {e}")
+
+    async def _forward_msgs(event, from_chat_id: int, msgs: list,
+                            is_private: bool = False):
+        """转发消息：优先 bot 直接转发，失败则下载再上传。"""
+        count = len(msgs)
+        msg_ids = [m.id for m in msgs]
+
+        # 策略1: bot 直接转发
+        try:
+            await bot.forward_messages(event.chat_id, msg_ids,
+                                       from_peer=from_chat_id)
+            logger.info("转发完成: bot直接转发 %d 条", count)
+            return
+        except Exception:
+            pass
+
+        # 策略2: userbot 转发（私聊跳过）
+        if not is_private:
+            try:
+                await userbot.forward_messages(event.chat_id, msg_ids,
+                                               from_peer=from_chat_id)
+                logger.info("转发完成: userbot转发 %d 条", count)
+                return
+            except Exception:
+                pass
+
+        # 策略3: userbot 下载 + bot 上传
+        logger.info("转发: 使用下载再上传, %d 条", count)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            files = []
+            captions = []
+            for m in msgs:
+                path = await userbot.download_media(m, file=tmpdir)
+                if path:
+                    files.append(path)
+                    captions.append(m.text or "")
+            if not files:
+                await event.reply("❌ 媒体下载失败")
+                return
+            if len(files) == 1:
+                await bot.send_file(event.chat_id, files[0],
+                                    caption=captions[0])
+            else:
+                await bot.send_file(event.chat_id, files,
+                                    caption=captions)
+            logger.info("转发完成: 下载再上传 %d 条", len(files))

@@ -1,0 +1,25 @@
+# Telegram API 配置（从 https://my.telegram.org 获取）
+api_id: 12345678
+api_hash: "your_api_hash_here"
+
+# Bot Token（从 @BotFather 获取）
+bot_token: "your_bot_token_here"
+
+# UserBot 手机号（国际格式，如 +8613800138000）
+phone: "+8613800138000"
+
+# 管理员 Telegram User ID 列表
+admin_ids:
+  - 123456789
+
+# 限流配置
+rate_limit:
+  batch_size: 100 # 每批获取消息数
+  forward_interval: [1, 2] # 每条转发间隔范围（秒）
+  batch_pause_every: 50 # 每转发N条后休息
+  batch_pause_time: [30, 60] # 休息时间范围（秒）
+  flood_wait_multiplier: 2 # FloodWait后间隔翻倍系数
+  max_flood_wait: 300 # 最大等待时间（秒），超过则暂停并通知
+
+# 是否允许非管理员使用链接解析
+allow_public_resolve: true
