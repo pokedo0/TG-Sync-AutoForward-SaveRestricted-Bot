@@ -6,3 +6,4 @@ __pycache__/
 *.session-journal
 .env
 config.yaml
+.claude/
