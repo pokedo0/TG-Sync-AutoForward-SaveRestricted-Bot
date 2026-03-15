@@ -39,7 +39,7 @@ source venv/bin/activate
 echo "⬇️ 正在安装依赖..."
 pip install --upgrade pip
 if [ -f "requirements.txt" ]; then
-    pip install -r requirements.txt
+    pip install --upgrade -r requirements.txt
 else
     echo "⚠️ 找不到 requirements.txt，跳过安装依赖。"
 fi
