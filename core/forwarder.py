@@ -1,13 +1,13 @@
 """转发引擎：智能降级策略，选择最小成本的转发方式。"""
 import asyncio
 import logging
-import os
 import tempfile
 
 from telethon import TelegramClient, errors
-from telethon.tl.types import DocumentAttributeVideo, Message, MessageMediaDocument
+from telethon.tl.types import Message
 
 from core.message_logic import is_file_media, normalize_messages
+from core.media_transfer import MediaTransferHelper
 from core.rate_limiter import RateLimiter
 
 logger = logging.getLogger("tg_forward_bot.forwarder")
@@ -31,6 +31,12 @@ class Forwarder:
         self.download_part_size_kb = self._clamp_part_size_kb(
             transfer_cfg.get("download_part_size_kb", 512)
         )
+        self.media = MediaTransferHelper(
+            bot=self.bot,
+            userbot=self.userbot,
+            upload_part_size_kb=self.upload_part_size_kb,
+            download_part_size_kb=self.download_part_size_kb,
+        )
 
     async def forward_message(self, source_chat_id: int, msg_id: int,
                               target_chat_id: int, mode: str = "copy",
@@ -39,27 +45,10 @@ class Forwarder:
         转发单条消息，返回目标消息 ID。失败返回 None。
         降级链：Bot直接转发 → UserBot读+Bot写 → UserBot下载+Bot上传 → 发失败标记
         """
-        await self.rl.wait()
-
-        # 策略1: Bot 直接转发/复制
-        result = await self._try_bot_direct(source_chat_id, msg_id,
-                                            target_chat_id, mode, target_topic_id)
+        result = await self._run_message_strategies(
+            source_chat_id, msg_id, target_chat_id, mode, target_topic_id
+        )
         if result is not None:
-            logger.info("msg=%s 策略1(Bot直接)成功 -> target_msg=%s", msg_id, result)
-            return result
-
-        # 策略2: UserBot 读取消息，Bot 转发
-        result = await self._try_userbot_read_bot_forward(
-            source_chat_id, msg_id, target_chat_id, mode, target_topic_id)
-        if result is not None:
-            logger.info("msg=%s 策略2(UserBot读+Bot写)成功 -> target_msg=%s", msg_id, result)
-            return result
-
-        # 策略3: UserBot 下载 + Bot 重新上传（突破转发保护）
-        result = await self._try_userbot_download_bot_upload(
-            source_chat_id, msg_id, target_chat_id, target_topic_id)
-        if result is not None:
-            logger.info("msg=%s 策略3(下载+上传)成功 -> target_msg=%s", msg_id, result)
             return result
 
         # 策略4: 发送失败标记
@@ -78,24 +67,10 @@ class Forwarder:
             return []
 
         msg_ids = sorted(set(msg_ids))
-        await self.rl.wait()
-
-        result = await self._try_bot_direct_album(
-            source_chat_id, msg_ids, target_chat_id, mode, target_topic_id)
+        result = await self._run_album_strategies(
+            source_chat_id, msg_ids, target_chat_id, mode, target_topic_id
+        )
         if result:
-            logger.info("album=%s 策略1(Bot直接)成功 -> target_msgs=%s", msg_ids, result)
-            return result
-
-        result = await self._try_userbot_read_bot_forward_album(
-            source_chat_id, msg_ids, target_chat_id, mode, target_topic_id)
-        if result:
-            logger.info("album=%s 策略2(UserBot读+Bot写)成功 -> target_msgs=%s", msg_ids, result)
-            return result
-
-        result = await self._try_userbot_download_bot_upload_album(
-            source_chat_id, msg_ids, target_chat_id, target_topic_id)
-        if result:
-            logger.info("album=%s 策略3(下载+上传)成功 -> target_msgs=%s", msg_ids, result)
             return result
 
         forwarded: list[int] = []
@@ -105,6 +80,44 @@ class Forwarder:
             if target_mid:
                 forwarded.append(target_mid)
         return forwarded
+
+    async def _run_message_strategies(self, source_chat_id: int, msg_id: int,
+                                      target_chat_id: int, mode: str,
+                                      target_topic_id: int | None) -> int | None:
+        await self.rl.wait()
+        strategies = [
+            ("策略1(Bot直接)", self._try_bot_direct,
+             (source_chat_id, msg_id, target_chat_id, mode, target_topic_id)),
+            ("策略2(UserBot读+Bot写)", self._try_userbot_read_bot_forward,
+             (source_chat_id, msg_id, target_chat_id, mode, target_topic_id)),
+            ("策略3(下载+上传)", self._try_userbot_download_bot_upload,
+             (source_chat_id, msg_id, target_chat_id, target_topic_id)),
+        ]
+        for strategy_name, strategy_func, args in strategies:
+            result = await strategy_func(*args)
+            if result is not None:
+                logger.info("msg=%s %s成功 -> target_msg=%s", msg_id, strategy_name, result)
+                return result
+        return None
+
+    async def _run_album_strategies(self, source_chat_id: int, msg_ids: list[int],
+                                    target_chat_id: int, mode: str,
+                                    target_topic_id: int | None) -> list[int]:
+        await self.rl.wait()
+        strategies = [
+            ("策略1(Bot直接)", self._try_bot_direct_album,
+             (source_chat_id, msg_ids, target_chat_id, mode, target_topic_id)),
+            ("策略2(UserBot读+Bot写)", self._try_userbot_read_bot_forward_album,
+             (source_chat_id, msg_ids, target_chat_id, mode, target_topic_id)),
+            ("策略3(下载+上传)", self._try_userbot_download_bot_upload_album,
+             (source_chat_id, msg_ids, target_chat_id, target_topic_id)),
+        ]
+        for strategy_name, strategy_func, args in strategies:
+            result = await strategy_func(*args)
+            if result:
+                logger.info("album=%s %s成功 -> target_msgs=%s", msg_ids, strategy_name, result)
+                return result
+        return []
 
     async def _try_bot_direct(self, source_chat_id, msg_id,
                               target_chat_id, mode, topic_id) -> int | None:
@@ -224,17 +237,19 @@ class Forwarder:
                 logger.info("策略3: msg=%s UserBot 无法获取消息", msg_id)
                 return None
 
-            reply_to = topic_id if topic_id else None
+            reply_to = self._reply_to(topic_id)
 
             if is_file_media(msg):
                 with tempfile.TemporaryDirectory() as tmpdir:
-                    path = await self._download_media_to_path(msg, tmpdir)
+                    path = await self.media.download_media_to_path(msg, tmpdir)
                     if path:
-                        thumb_path = await self._download_video_thumb_to_path(msg, tmpdir)
-                        send_kwargs = self._build_send_file_kwargs(
+                        thumb_path = await self.media.download_video_thumb_to_path(msg, tmpdir)
+                        send_kwargs = self.media.build_send_file_kwargs(
                             msg, reply_to, thumb_path=thumb_path
                         )
-                        result = await self.bot.send_file(target_chat_id, path, **send_kwargs)
+                        result = await self.media.send_file_with_compat(
+                            target_chat_id, path, **send_kwargs
+                        )
                         return result.id if result else None
                     else:
                         logger.warning("策略3: msg=%s 媒体下载失败", msg_id)
@@ -262,34 +277,14 @@ class Forwarder:
                 logger.info("策略3相册: UserBot 无法获取消息 %s", msg_ids)
                 return []
 
-            reply_to = topic_id if topic_id else None
+            reply_to = self._reply_to(topic_id)
             media_msgs = [m for m in msgs if is_file_media(m)]
             if not media_msgs:
                 logger.info("策略3相册: 无可下载媒体")
                 return []
 
             with tempfile.TemporaryDirectory() as tmpdir:
-                sem = asyncio.Semaphore(self.album_download_concurrency)
-
-                async def _download_one(index: int, message: Message):
-                    async with sem:
-                        path = await self._download_media_to_path(message, tmpdir)
-                        return index, message, path
-
-                tasks = [
-                    asyncio.create_task(_download_one(idx, m))
-                    for idx, m in enumerate(media_msgs)
-                ]
-                downloaded = await asyncio.gather(*tasks, return_exceptions=True)
-
-                ok_items: list[tuple[int, Message, str]] = []
-                for item in downloaded:
-                    if isinstance(item, Exception):
-                        logger.warning("策略3相册: 并发下载异常: %s", item)
-                        continue
-                    index, message, path = item
-                    if path:
-                        ok_items.append((index, message, path))
+                ok_items = await self._download_album_media(media_msgs, tmpdir)
 
                 ok_items.sort(key=lambda x: x[0])
                 files = [path for _, _, path in ok_items]
@@ -332,6 +327,30 @@ class Forwarder:
         except Exception as e:
             logger.error("发送失败标记异常: msg=%s err=%s", msg_id, e)
             return None
+
+    async def _download_album_media(self, media_msgs: list[Message], tmpdir: str):
+        sem = asyncio.Semaphore(self.album_download_concurrency)
+
+        async def _download_one(index: int, message: Message):
+            async with sem:
+                path = await self.media.download_media_to_path(message, tmpdir)
+                return index, message, path
+
+        tasks = [
+            asyncio.create_task(_download_one(idx, m))
+            for idx, m in enumerate(media_msgs)
+        ]
+        downloaded = await asyncio.gather(*tasks, return_exceptions=True)
+
+        ok_items: list[tuple[int, Message, str]] = []
+        for item in downloaded:
+            if isinstance(item, Exception):
+                logger.warning("策略3相册: 并发下载异常: %s", item)
+                continue
+            index, message, path = item
+            if path:
+                ok_items.append((index, message, path))
+        return ok_items
 
     async def _copy_message(self, client: TelegramClient, msg: Message,
                             target_chat_id: int, topic_id: int | None):
@@ -383,107 +402,16 @@ class Forwarder:
         return await retry_func(*args)
 
     @staticmethod
+    def _reply_to(topic_id: int | None) -> int | None:
+        return topic_id if topic_id else None
+
+    @staticmethod
     def _clamp_part_size_kb(value) -> int:
         try:
             n = int(value)
         except Exception:
             n = 512
         return max(32, min(512, n))
-
-    @staticmethod
-    def _is_video_message(msg: Message) -> bool:
-        media = getattr(msg, "media", None)
-        if not isinstance(media, MessageMediaDocument):
-            return False
-        document = getattr(media, "document", None)
-        if not document:
-            return False
-        attrs = getattr(document, "attributes", []) or []
-        if any(isinstance(a, DocumentAttributeVideo) for a in attrs):
-            return True
-        mime_type = getattr(document, "mime_type", "") or ""
-        return mime_type.startswith("video/")
-
-    @staticmethod
-    def _get_document_attributes(msg: Message):
-        media = getattr(msg, "media", None)
-        if not isinstance(media, MessageMediaDocument):
-            return None
-        document = getattr(media, "document", None)
-        if not document:
-            return None
-        attrs = getattr(document, "attributes", None)
-        return attrs or None
-
-    @staticmethod
-    def _has_document_thumbs(msg: Message) -> bool:
-        media = getattr(msg, "media", None)
-        if not isinstance(media, MessageMediaDocument):
-            return False
-        document = getattr(media, "document", None)
-        if not document:
-            return False
-        thumbs = getattr(document, "thumbs", None) or []
-        return bool(thumbs)
-
-    def _build_send_file_kwargs(self, msg: Message, reply_to: int | None,
-                                thumb_path: str | None = None) -> dict:
-        kwargs = {
-            "caption": msg.text or "",
-            "reply_to": reply_to,
-            "part_size_kb": self.upload_part_size_kb,
-        }
-        if self._is_video_message(msg):
-            # 让 Telegram 客户端按可流式视频处理，避免“必须完整下载后播放”。
-            kwargs["supports_streaming"] = True
-            attrs = self._get_document_attributes(msg)
-            if attrs:
-                kwargs["attributes"] = attrs
-            if thumb_path:
-                kwargs["thumb"] = thumb_path
-        return kwargs
-
-    def _build_download_target_path(self, msg: Message, tmpdir: str) -> str:
-        file_obj = getattr(msg, "file", None)
-        ext = None
-        if file_obj:
-            file_name = getattr(file_obj, "name", None)
-            if file_name:
-                _, ext = os.path.splitext(file_name)
-            if not ext:
-                ext = getattr(file_obj, "ext", None)
-        if not ext:
-            ext = ".mp4" if self._is_video_message(msg) else ".bin"
-        return os.path.join(tmpdir, f"{msg.id}{ext}")
-
-    async def _download_media_to_path(self, msg: Message, tmpdir: str) -> str | None:
-        path = self._build_download_target_path(msg, tmpdir)
-        try:
-            # 兼容不同 Telethon 版本：部分版本不支持 download_media(part_size_kb=...)
-            return await self.userbot.download_media(
-                msg, file=path, part_size_kb=self.download_part_size_kb
-            )
-        except TypeError:
-            return await self.userbot.download_media(msg, file=path)
-
-    async def _download_video_thumb_to_path(self, msg: Message, tmpdir: str) -> str | None:
-        if not self._is_video_message(msg):
-            return None
-        if not self._has_document_thumbs(msg):
-            return None
-        thumb_base = os.path.join(tmpdir, f"{msg.id}_thumb")
-        try:
-            return await self.userbot.download_media(
-                msg, file=thumb_base, thumb=-1, part_size_kb=self.download_part_size_kb
-            )
-        except TypeError:
-            try:
-                return await self.userbot.download_media(msg, file=thumb_base, thumb=-1)
-            except TypeError:
-                return None
-        except Exception as e:
-            logger.info("策略3: msg=%s 缩略图下载失败: %s", getattr(msg, "id", "?"), e)
-            return None
 
     async def _resolve_source_for_bot(self, source_chat_id):
         try:

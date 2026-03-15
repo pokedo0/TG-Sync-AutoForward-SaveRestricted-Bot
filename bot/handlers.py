@@ -1,8 +1,6 @@
 """Bot 命令处理器：注册所有 Telegram Bot 命令。"""
 import asyncio
 import logging
-import re
-from dataclasses import dataclass
 
 from telethon import TelegramClient, events, errors, Button
 
@@ -11,6 +9,12 @@ from bot.link_parser import (
     parse_link,
     resolve_chat_id,
     resolve_linked_chat,
+)
+from bot.handler_common import (
+    STATUS_EMOJI,
+    FetchTarget,
+    ParsedSource,
+    extract_tg_link,
 )
 from bot.telegram_utils import (
     resolve_chat_name, resolve_topic_name, describe_source,
@@ -28,26 +32,6 @@ from db import models
 
 logger = logging.getLogger("tg_forward_bot.handlers")
 
-_TG_LINK_RE = re.compile(r"https?://t\.me/\S+")
-
-_STATUS_EMOJI = {
-    "running": "🟢", "paused": "⏸", "completed": "✅", "failed": "❌"
-}
-
-
-@dataclass
-class ParsedSource:
-    parsed: ParsedLink
-    source_id: int
-    mode: str
-
-
-@dataclass
-class FetchTarget:
-    chat_id: int
-    msg_id: int
-
-
 def register_handlers(bot: TelegramClient, userbot: TelegramClient,
                       db: Database, config: dict,
                       monitor_manager: MonitorManager):
@@ -64,15 +48,11 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
     # 内部共享 helpers
     # ------------------------------------------------------------------
 
-    def _extract_tg_link(text: str) -> str | None:
-        match = _TG_LINK_RE.search(text)
-        return match.group() if match else None
-
     async def _parse_source(event) -> ParsedSource | None:
         """从命令消息中解析链接并返回 ParsedSource。"""
         text = event.raw_text
         mode = "forward" if "--forward" in text else "copy"
-        link = _extract_tg_link(text)
+        link = extract_tg_link(text)
         if not link:
             await event.reply("❌ 请提供有效的 Telegram 链接")
             return None
@@ -111,7 +91,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         buttons = []
         for t in tasks:
             emoji = "🔄" if t["type"] == "sync" else "👁"
-            status = _STATUS_EMOJI.get(t["status"], "❓")
+            status = STATUS_EMOJI.get(t["status"], "❓")
             src_name = truncate(
                 await resolve_chat_name(userbot, t["source_chat_id"]), 20)
             topic_part = ""
@@ -297,7 +277,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             return
 
         emoji = "🔄" if t["type"] == "sync" else "👁"
-        status = _STATUS_EMOJI.get(t["status"], "❓")
+        status = STATUS_EMOJI.get(t["status"], "❓")
 
         # 解析源名称
         src_name = await resolve_chat_name(userbot, t["source_chat_id"])
@@ -465,7 +445,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         if not allow_public and not is_admin(event.sender_id):
             return
 
-        link = _extract_tg_link(event.raw_text)
+        link = extract_tg_link(event.raw_text)
         if not link:
             return
 
