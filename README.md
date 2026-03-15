@@ -1,4 +1,4 @@
-# tg_forward_bot
+# TG-Sync-AutoForward-SaveRestricted-Bot
 
 基于 Telethon 的 Telegram 转发工具，采用 `Bot + UserBot` 双客户端架构，支持：
 
@@ -19,7 +19,7 @@
 ## 2. 项目结构
 
 ```text
-tg_forward_bot/
+TG-Sync-AutoForward-SaveRestricted-Bot/
 ├── main.py
 ├── config.example.yaml
 ├── bot/

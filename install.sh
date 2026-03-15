@@ -5,12 +5,12 @@ set -e
 
 # 获取当前工作目录
 APP_DIR=$(pwd)
-SERVICE_NAME="tg_forward_bot"
+SERVICE_NAME="TG-Sync-AutoForward-SaveRestricted-Bot"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 CURRENT_USER=$(whoami)
 
 echo "====================================="
-echo "  🚀 开始安装 tg_forward_bot (Debian)"
+echo "  🚀 开始安装 TG-Sync-AutoForward-SaveRestricted-Bot (Debian)"
 echo "====================================="
 
 # 检查是否以 root 或 sudo 运行（因为写入 /etc/systemd/ 需要权限）
