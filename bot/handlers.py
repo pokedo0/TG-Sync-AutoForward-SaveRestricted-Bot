@@ -3,6 +3,7 @@ import asyncio
 import logging
 
 from telethon import TelegramClient, events, errors, Button
+from telethon.tl import types
 
 from bot.link_parser import (
     ParsedLink,
@@ -44,10 +45,41 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
     def is_admin(user_id: int) -> bool:
         return user_id in admin_ids
 
+    def _is_admin_via_chat_identity(event) -> bool:
+        """兼容匿名管理员/频道身份发言。"""
+        if not (event.is_group or event.is_channel):
+            return False
+        msg = getattr(event, "message", None)
+        if msg is None:
+            return False
+        from_id = getattr(msg, "from_id", None)
+        if from_id is None:
+            # 匿名管理员消息常见为 from_id 为空（Telethon）。
+            return True
+        return isinstance(from_id, types.PeerChannel)
+
+    async def _chat_has_configured_admin(chat_id: int) -> bool:
+        """检查目标群/频道中是否包含配置里的管理员。"""
+        try:
+            admins = await bot.get_participants(
+                chat_id,
+                filter=types.ChannelParticipantsAdmins(),
+            )
+        except Exception as e:
+            logger.warning("拉取管理员列表失败 chat=%s err=%s", chat_id, e)
+            return False
+        admin_member_ids = {u.id for u in admins if getattr(u, "id", None) is not None}
+        return bool(admin_member_ids & admin_ids)
+
     async def _require_admin(event, *, alert: bool = False) -> bool:
         """统一管理员校验。"""
-        if is_admin(event.sender_id):
+        if event.sender_id is not None and is_admin(event.sender_id):
             return True
+        if event.is_private:
+            pass
+        elif _is_admin_via_chat_identity(event):
+            if await _chat_has_configured_admin(event.chat_id):
+                return True
         if alert:
             await event.answer("⛔ 无权限", alert=True)
         else:
@@ -141,6 +173,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
     async def _forward_private_message(event, fetch_chat_id: int, msg,
                                        parsed: ParsedLink):
         """私聊链接解析后的统一转发逻辑。"""
+        reply_to_id = event.message.id
         kind = classify_message_kind(msg, single=parsed.single)
         if kind == "album":
             album_msgs = await collect_album_messages(
@@ -149,7 +182,8 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
                         len(album_msgs), msg.grouped_id)
             source_ids = [m.id for m in album_msgs]
             target_ids = await forwarder.forward_album(
-                fetch_chat_id, source_ids, event.chat_id, mode="copy")
+                fetch_chat_id, source_ids, event.chat_id, mode="copy",
+                target_topic_id=reply_to_id)
             if not target_ids:
                 await event.reply("❌ 转发失败，已尝试所有策略")
             return
@@ -160,7 +194,8 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             else:
                 logger.info("纯文本消息")
             target_id = await forwarder.forward_message(
-                fetch_chat_id, msg.id, event.chat_id, mode="copy")
+                fetch_chat_id, msg.id, event.chat_id, mode="copy",
+                target_topic_id=reply_to_id)
             if not target_id:
                 await event.reply("❌ 转发失败，已尝试所有策略")
             return
@@ -261,7 +296,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         interval = rl.get("forward_interval", [2, 5])
         source_desc = await describe_source(userbot, source_id, parsed)
         topic_info = await _format_target_topic(target_chat_id, target_topic_id)
-        await event.reply(
+        start_msg = await event.reply(
             f"🚀 同步任务 #{task_id} 已创建\n"
             f"📌 源: {source_desc}\n"
             f"⏱ 转发间隔: {interval[0]}-{interval[1]}秒/条\n"
@@ -272,7 +307,8 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             source_topic_id=parsed.topic_id,
             target_topic_id=target_topic_id,
             notify_chat_id=event.chat_id,
-            notify_topic_id=target_topic_id))
+            notify_topic_id=target_topic_id,
+            notify_reply_to_msg_id=start_msg.id))
         _sync_tasks[task_id] = task
 
     @bot.on(events.NewMessage(pattern=r"/monitor(?:@\w+)?\s+"))

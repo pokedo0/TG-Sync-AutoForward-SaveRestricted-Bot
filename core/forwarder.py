@@ -53,8 +53,38 @@ class Forwarder:
 
         # 策略4: 发送失败标记
         logger.warning("msg=%s 所有策略失败，发送 #fail2forward 标记", msg_id)
-        return await self._send_fail_marker(source_chat_id, msg_id,
-                                            target_chat_id, target_topic_id)
+        return await self.send_fail_marker(
+            source_chat_id, msg_id, target_chat_id, target_topic_id
+        )
+
+    async def detect_restriction(
+        self,
+        source_chat_id: int,
+        msg_id: int | None = None,
+    ) -> tuple[bool, str]:
+        """硬封禁并集：message.restriction_reason.platform=all 或 chat级全平台封禁。"""
+        try:
+            entity = await self.userbot.get_entity(source_chat_id)
+            if getattr(entity, "restricted", False):
+                chat_reasons = getattr(entity, "restriction_reason", None) or []
+                if self._has_platform_all_reason(chat_reasons):
+                    return True, "chat.restricted+reason.platform_all"
+        except Exception:
+            pass
+
+        if msg_id is None:
+            return False, ""
+
+        try:
+            msg = await self._get_single_message(self.userbot, source_chat_id, msg_id)
+            if msg:
+                msg_reasons = getattr(msg, "restriction_reason", None) or []
+                if self._has_platform_all_reason(msg_reasons):
+                    return True, "message.reason.platform_all"
+        except Exception:
+            pass
+
+        return False, ""
 
     async def forward_album(self, source_chat_id: int, msg_ids: list[int],
                             target_chat_id: int, mode: str = "copy",
@@ -302,18 +332,27 @@ class Forwarder:
             logger.warning("策略3相册: 异常: %s", e)
             return []
 
-    async def _send_fail_marker(self, source_chat_id, msg_id,
-                                target_chat_id, topic_id) -> int | None:
-        try:
-            entity = await self.userbot.get_entity(source_chat_id)
-            username = getattr(entity, "username", None)
-            if username:
-                link = f"https://t.me/{username}/{msg_id}"
-            else:
-                chat_id = str(source_chat_id).replace("-100", "")
-                link = f"https://t.me/c/{chat_id}/{msg_id}"
+    async def build_source_link(self, source_chat_id: int, msg_id: int) -> str:
+        """构造源消息链接（公开或私有）。"""
+        entity = await self.userbot.get_entity(source_chat_id)
+        username = getattr(entity, "username", None)
+        if username:
+            return f"https://t.me/{username}/{msg_id}"
+        chat_id = str(source_chat_id).replace("-100", "")
+        return f"https://t.me/c/{chat_id}/{msg_id}"
 
-            text = f"⚠️ 无法转发的消息: {link}\n#fail2forward"
+    async def send_fail_marker(
+        self,
+        source_chat_id,
+        msg_id,
+        target_chat_id,
+        topic_id,
+        reason: str | None = None,
+    ) -> int | None:
+        try:
+            link = await self.build_source_link(source_chat_id, msg_id)
+            reason_suffix = f"（{reason}）" if reason else ""
+            text = f"⚠️ 无法转发的消息{reason_suffix}: {link}\n#fail2forward"
             result = await self.bot.send_message(
                 target_chat_id, text,
                 reply_to=topic_id if topic_id else None)
@@ -448,3 +487,15 @@ class Forwarder:
             except Exception:
                 pass
         return source_chat_id
+
+    @staticmethod
+    def _has_platform_all_reason(reasons) -> bool:
+        for reason in reasons or []:
+            platform = None
+            if isinstance(reason, dict):
+                platform = reason.get("platform")
+            else:
+                platform = getattr(reason, "platform", None)
+            if isinstance(platform, str) and platform.lower() == "all":
+                return True
+        return False

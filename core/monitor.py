@@ -65,6 +65,23 @@ class MonitorManager(ForwardingComponent):
         mode = buffer["mode"]
         target_topic_id = buffer["target_topic_id"]
 
+        restricted, restricted_field = await self.forwarder.detect_restriction(
+            source_chat_id, msg_ids[0]
+        )
+        if restricted:
+            logger.info(
+                "监控 #%s 相册受限 grouped_id=%s field=%s",
+                task_id, grouped_id, restricted_field
+            )
+            await self.forwarder.send_fail_marker(
+                source_chat_id=source_chat_id,
+                msg_id=msg_ids[0],
+                target_chat_id=target_chat_id,
+                topic_id=target_topic_id,
+                reason=f"受限: {restricted_field}",
+            )
+            return
+
         logger.info("监控 #%s 聚合相册 grouped_id=%s 条数=%s",
                     task_id, grouped_id, len(msg_ids))
         target_msg_ids = await self.forwarder.forward_album(
@@ -88,6 +105,23 @@ class MonitorManager(ForwardingComponent):
             logger.info("监控 #%s 收到新消息: chat=%s msg=%s",
                         task_id, source_chat_id, event.message.id)
             try:
+                restricted, restricted_field = await self.forwarder.detect_restriction(
+                    source_chat_id, event.message.id
+                )
+                if restricted:
+                    logger.info(
+                        "监控 #%s 受限消息 msg=%s field=%s",
+                        task_id, event.message.id, restricted_field
+                    )
+                    await self.forwarder.send_fail_marker(
+                        source_chat_id=source_chat_id,
+                        msg_id=event.message.id,
+                        target_chat_id=target_chat_id,
+                        topic_id=target_topic_id,
+                        reason=f"受限: {restricted_field}",
+                    )
+                    return
+
                 grouped_id = getattr(event.message, "grouped_id", None)
                 if grouped_id and is_album_candidate(event.message):
                     key = (task_id, grouped_id)

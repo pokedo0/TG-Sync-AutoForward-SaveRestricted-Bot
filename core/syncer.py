@@ -24,14 +24,16 @@ class Syncer(ForwardingComponent):
         self,
         notify_chat_id: int | None,
         notify_topic_id: int | None,
+        notify_reply_to_msg_id: int | None,
         text: str,
     ) -> None:
         if not notify_chat_id:
             return
+        reply_to = notify_reply_to_msg_id if notify_reply_to_msg_id else notify_topic_id
         await self.bot.send_message(
             notify_chat_id,
             text,
-            reply_to=notify_topic_id if notify_topic_id else None,
+            reply_to=reply_to if reply_to else None,
         )
 
     async def _handle_collect_error(
@@ -92,14 +94,14 @@ class Syncer(ForwardingComponent):
         target_topic_id: int | None,
         unit_kind: str,
         source_ids: list[int],
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, bool]:
         if unit_kind == "album":
             target_ids = await self.forwarder.forward_album(
                 source_chat_id, source_ids, target_chat_id, mode, target_topic_id
             )
             for src_id, tgt_id in zip(source_ids, target_ids):
                 await models.save_message_map(self.db, task_id, src_id, tgt_id)
-            return len(source_ids), source_ids[-1]
+            return len(target_ids), source_ids[-1], bool(target_ids)
 
         source_msg_id = source_ids[0]
         target_msg_id = await self.forwarder.forward_message(
@@ -107,26 +109,35 @@ class Syncer(ForwardingComponent):
         )
         if target_msg_id:
             await models.save_message_map(self.db, task_id, source_msg_id, target_msg_id)
-        return 1, source_msg_id
+            return 1, source_msg_id, True
+        return 0, source_msg_id, False
 
     async def start_sync(self, task_id: int, source_chat_id: int,
                          target_chat_id: int, mode: str = "copy",
                          source_topic_id: int | None = None,
                          target_topic_id: int | None = None,
                          notify_chat_id: int | None = None,
-                         notify_topic_id: int | None = None):
+                         notify_topic_id: int | None = None,
+                         notify_reply_to_msg_id: int | None = None):
         """执行历史同步任务。"""
         self._cancel_flags[task_id] = False
         task = await models.get_task(self.db, task_id)
         offset_id = task["last_synced_msg_id"] if task else 0
 
         async def _notify(text: str) -> None:
-            await self._notify(notify_chat_id, notify_topic_id, text)
+            await self._notify(
+                notify_chat_id,
+                notify_topic_id,
+                notify_reply_to_msg_id,
+                text,
+            )
 
         logger.info("同步任务 #%s 开始: source=%s topic=%s offset=%s",
                      task_id, source_chat_id, source_topic_id, offset_id)
 
         total_forwarded = 0
+        restricted_messages = 0
+        failed_units = 0
         all_msgs = await self._collect_messages(
             task_id, source_chat_id, source_topic_id, offset_id, _notify
         )
@@ -155,7 +166,20 @@ class Syncer(ForwardingComponent):
                 await _notify(f"⏸ 同步已暂停，已完成 {total_forwarded}/{total}")
                 return
 
-            msg_count, last_msg_id = await self._forward_unit(
+            restricted, restricted_field = await self.forwarder.detect_restriction(
+                source_chat_id, source_ids[0]
+            )
+            if restricted:
+                restricted_messages += len(source_ids)
+                last_msg_id = source_ids[-1]
+                await models.update_last_synced(self.db, task_id, last_msg_id)
+                logger.info(
+                    "同步任务 #%s 跳过受限消息单元 kind=%s ids=%s field=%s",
+                    task_id, kind, source_ids, restricted_field
+                )
+                continue
+
+            msg_count, last_msg_id, success = await self._forward_unit(
                 task_id=task_id,
                 source_chat_id=source_chat_id,
                 target_chat_id=target_chat_id,
@@ -167,6 +191,8 @@ class Syncer(ForwardingComponent):
 
             await models.update_last_synced(self.db, task_id, last_msg_id)
             total_forwarded += msg_count
+            if not success:
+                failed_units += 1
 
             if total_forwarded % 100 == 0:
                 logger.info("同步任务 #%s 进度: %d/%d", task_id, total_forwarded, total)
@@ -174,7 +200,12 @@ class Syncer(ForwardingComponent):
 
         await models.update_task_status(self.db, task_id, "completed")
         logger.info("同步任务 #%s 完成，共转发 %d 条", task_id, total_forwarded)
-        await _notify(f"✅ 同步完成，共转发 {total_forwarded} 条消息")
+        await _notify(
+            "✅ 同步完成"
+            f"\n• 成功转发: {total_forwarded} 条"
+            f"\n• 跳过受限: {restricted_messages} 条"
+            f"\n• 其他失败: {failed_units} 组"
+        )
 
     def cancel(self, task_id: int):
         self._cancel_flags[task_id] = True
