@@ -44,6 +44,24 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
     def is_admin(user_id: int) -> bool:
         return user_id in admin_ids
 
+    async def _require_admin(event, *, alert: bool = False) -> bool:
+        """统一管理员校验。"""
+        if is_admin(event.sender_id):
+            return True
+        if alert:
+            await event.answer("⛔ 无权限", alert=True)
+        else:
+            await event.reply("⛔ 无权限")
+        return False
+
+    async def _get_task_or_alert(event, task_id: int) -> dict | None:
+        """按 task_id 获取任务，不存在时给出回调提示。"""
+        task = await models.get_task(db, task_id)
+        if task:
+            return task
+        await event.answer("任务不存在", alert=True)
+        return None
+
     # ------------------------------------------------------------------
     # 内部共享 helpers
     # ------------------------------------------------------------------
@@ -181,8 +199,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
     @bot.on(events.NewMessage(pattern=r"/sync(?:@\w+)?\s+"))
     async def on_sync(event):
         logger.info("收到 /sync 命令 from user=%s chat=%s", event.sender_id, event.chat_id)
-        if not is_admin(event.sender_id):
-            await event.reply("⛔ 无权限")
+        if not await _require_admin(event):
             return
 
         result = await _parse_source(event)
@@ -222,8 +239,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
     @bot.on(events.NewMessage(pattern=r"/monitor(?:@\w+)?\s+"))
     async def on_monitor(event):
         logger.info("收到 /monitor 命令 from user=%s chat=%s", event.sender_id, event.chat_id)
-        if not is_admin(event.sender_id):
-            await event.reply("⛔ 无权限")
+        if not await _require_admin(event):
             return
 
         result = await _parse_source(event)
@@ -257,8 +273,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
 
     @bot.on(events.NewMessage(pattern=r"/list(?:@\w+)?$"))
     async def on_list(event):
-        if not is_admin(event.sender_id):
-            await event.reply("⛔ 无权限")
+        if not await _require_admin(event):
             return
 
         tasks = await models.get_all_active_tasks(db)
@@ -323,22 +338,19 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
 
     @bot.on(events.CallbackQuery(pattern=rb"task:(\d+)"))
     async def on_task_detail(event):
-        if not is_admin(event.sender_id):
-            await event.answer("⛔ 无权限", alert=True)
+        if not await _require_admin(event, alert=True):
             return
         task_id = int(event.pattern_match.group(1))
         await _show_task_detail(event, task_id)
 
     @bot.on(events.CallbackQuery(pattern=rb"pause:(\d+)"))
     async def on_pause(event):
-        if not is_admin(event.sender_id):
-            await event.answer("⛔ 无权限", alert=True)
+        if not await _require_admin(event, alert=True):
             return
 
         task_id = int(event.pattern_match.group(1))
-        t = await models.get_task(db, task_id)
+        t = await _get_task_or_alert(event, task_id)
         if not t:
-            await event.answer("任务不存在", alert=True)
             return
 
         if t["status"] == "running":
@@ -350,13 +362,14 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
 
     @bot.on(events.CallbackQuery(pattern=rb"resume:(\d+)"))
     async def on_resume(event):
-        if not is_admin(event.sender_id):
-            await event.answer("⛔ 无权限", alert=True)
+        if not await _require_admin(event, alert=True):
             return
 
         task_id = int(event.pattern_match.group(1))
-        t = await models.get_task(db, task_id)
-        if not t or t["type"] != "monitor":
+        t = await _get_task_or_alert(event, task_id)
+        if not t:
+            return
+        if t["type"] != "monitor":
             await event.answer("仅支持恢复监控任务", alert=True)
             return
 
@@ -371,14 +384,12 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
 
     @bot.on(events.CallbackQuery(pattern=rb"delete:(\d+)"))
     async def on_delete(event):
-        if not is_admin(event.sender_id):
-            await event.answer("⛔ 无权限", alert=True)
+        if not await _require_admin(event, alert=True):
             return
 
         task_id = int(event.pattern_match.group(1))
-        t = await models.get_task(db, task_id)
+        t = await _get_task_or_alert(event, task_id)
         if not t:
-            await event.answer("任务不存在", alert=True)
             return
 
         if t["status"] == "running":
@@ -391,8 +402,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
 
     @bot.on(events.CallbackQuery(pattern=rb"clear_all"))
     async def on_clear_all(event):
-        if not is_admin(event.sender_id):
-            await event.answer("⛔ 无权限", alert=True)
+        if not await _require_admin(event, alert=True):
             return
 
         tasks = await models.get_all_active_tasks(db)
@@ -407,8 +417,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
 
     @bot.on(events.CallbackQuery(pattern=rb"back_list"))
     async def on_back_list(event):
-        if not is_admin(event.sender_id):
-            await event.answer("⛔ 无权限", alert=True)
+        if not await _require_admin(event, alert=True):
             return
         await _refresh_list(event)
 
@@ -423,8 +432,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
 
     @bot.on(events.NewMessage(pattern=r"/settings(?:@\w+)?$"))
     async def on_settings(event):
-        if not is_admin(event.sender_id):
-            await event.reply("⛔ 无权限")
+        if not await _require_admin(event):
             return
 
         rl = _get_dynamic_rate_limit(config)

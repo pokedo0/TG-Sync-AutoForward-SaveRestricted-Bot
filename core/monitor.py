@@ -37,6 +37,20 @@ class MonitorManager:
             "target_topic_id": target_topic_id,
         }
 
+    @staticmethod
+    def _match_source_topic(message, source_topic_id: int | None) -> bool:
+        """判断消息是否属于指定 source topic。"""
+        if not source_topic_id:
+            return True
+        reply_to = getattr(message, "reply_to", None)
+        if not reply_to:
+            return False
+        top_msg_id = (
+            getattr(reply_to, "reply_to_top_id", None)
+            or getattr(reply_to, "reply_to_msg_id", None)
+        )
+        return top_msg_id == source_topic_id
+
     async def _forward_and_save(self, task_id: int, source_chat_id: int, source_msg_id: int,
                                 target_chat_id: int, mode: str,
                                 target_topic_id: int | None):
@@ -74,14 +88,8 @@ class MonitorManager:
             if isinstance(event.message, MessageService):
                 return
             # 如果指定了 topic，只处理该 topic 的消息
-            if source_topic_id:
-                reply_to = getattr(event.message, "reply_to", None)
-                if not reply_to:
-                    return
-                top_msg_id = getattr(reply_to, "reply_to_top_id", None) or \
-                             getattr(reply_to, "reply_to_msg_id", None)
-                if top_msg_id != source_topic_id:
-                    return
+            if not self._match_source_topic(event.message, source_topic_id):
+                return
 
             logger.info("监控 #%s 收到新消息: chat=%s msg=%s",
                         task_id, source_chat_id, event.message.id)

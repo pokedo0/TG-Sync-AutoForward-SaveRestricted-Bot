@@ -126,14 +126,14 @@ class Forwarder:
             if mode == "forward":
                 result = await self.bot.forward_messages(
                     target_chat_id, msg_id, source_ref,
-                    **({"reply_to": topic_id} if topic_id else {}))
+                    **self._reply_kwargs(topic_id))
             else:
-                msgs = await self.bot.get_messages(source_ref, ids=msg_id)
-                if not msgs:
+                msg = await self._get_single_message(self.bot, source_ref, msg_id)
+                if not msg:
                     logger.info("策略1: msg=%s Bot 无法获取消息", msg_id)
                     return None
                 result = await self._copy_message(
-                    self.bot, msgs, target_chat_id, topic_id)
+                    self.bot, msg, target_chat_id, topic_id)
             return result.id if result else None
         except (errors.ChatForwardsRestrictedError,
                 errors.ChannelPrivateError,
@@ -155,10 +155,9 @@ class Forwarder:
             if mode == "forward":
                 result = await self.bot.forward_messages(
                     target_chat_id, msg_ids, source_ref,
-                    **({"reply_to": topic_id} if topic_id else {}))
+                    **self._reply_kwargs(topic_id))
             else:
-                msgs = await self.bot.get_messages(source_ref, ids=msg_ids)
-                msgs = normalize_messages(msgs)
+                msgs = await self._get_message_list(self.bot, source_ref, msg_ids)
                 if not msgs:
                     logger.info("策略1相册: Bot 无法获取消息 %s", msg_ids)
                     return []
@@ -180,14 +179,14 @@ class Forwarder:
     async def _try_userbot_read_bot_forward(self, source_chat_id, msg_id,
                                             target_chat_id, mode, topic_id) -> int | None:
         try:
-            msg = await self.userbot.get_messages(source_chat_id, ids=msg_id)
+            msg = await self._get_single_message(self.userbot, source_chat_id, msg_id)
             if not msg:
                 logger.info("策略2: msg=%s UserBot 无法获取消息", msg_id)
                 return None
             if mode == "forward":
                 result = await self.userbot.forward_messages(
                     target_chat_id, msg_id, source_chat_id,
-                    **({"reply_to": topic_id} if topic_id else {}))
+                    **self._reply_kwargs(topic_id))
             else:
                 result = await self._copy_message(
                     self.bot, msg, target_chat_id, topic_id)
@@ -206,15 +205,14 @@ class Forwarder:
     async def _try_userbot_read_bot_forward_album(self, source_chat_id, msg_ids,
                                                   target_chat_id, mode, topic_id) -> list[int]:
         try:
-            msgs = await self.userbot.get_messages(source_chat_id, ids=msg_ids)
-            msgs = normalize_messages(msgs)
+            msgs = await self._get_message_list(self.userbot, source_chat_id, msg_ids)
             if not msgs:
                 logger.info("策略2相册: UserBot 无法获取消息 %s", msg_ids)
                 return []
             if mode == "forward":
                 result = await self.userbot.forward_messages(
                     target_chat_id, msg_ids, source_chat_id,
-                    **({"reply_to": topic_id} if topic_id else {}))
+                    **self._reply_kwargs(topic_id))
             else:
                 result = await self._copy_album(self.bot, msgs, target_chat_id, topic_id)
             return self._extract_result_ids(result)
@@ -232,7 +230,7 @@ class Forwarder:
     async def _try_userbot_download_bot_upload(self, source_chat_id, msg_id,
                                                target_chat_id, topic_id) -> int | None:
         try:
-            msg = await self.userbot.get_messages(source_chat_id, ids=msg_id)
+            msg = await self._get_single_message(self.userbot, source_chat_id, msg_id)
             if not msg:
                 logger.info("策略3: msg=%s UserBot 无法获取消息", msg_id)
                 return None
@@ -271,8 +269,7 @@ class Forwarder:
     async def _try_userbot_download_bot_upload_album(self, source_chat_id, msg_ids,
                                                      target_chat_id, topic_id) -> list[int]:
         try:
-            msgs = await self.userbot.get_messages(source_chat_id, ids=msg_ids)
-            msgs = normalize_messages(msgs)
+            msgs = await self._get_message_list(self.userbot, source_chat_id, msg_ids)
             if not msgs:
                 logger.info("策略3相册: UserBot 无法获取消息 %s", msg_ids)
                 return []
@@ -404,6 +401,20 @@ class Forwarder:
     @staticmethod
     def _reply_to(topic_id: int | None) -> int | None:
         return topic_id if topic_id else None
+
+    @staticmethod
+    def _reply_kwargs(topic_id: int | None) -> dict:
+        return {"reply_to": topic_id} if topic_id else {}
+
+    async def _get_single_message(self, client: TelegramClient,
+                                  chat_or_entity, msg_id: int) -> Message | None:
+        msg = await client.get_messages(chat_or_entity, ids=msg_id)
+        return msg if msg else None
+
+    async def _get_message_list(self, client: TelegramClient,
+                                chat_or_entity, msg_ids: list[int]) -> list[Message]:
+        msgs = await client.get_messages(chat_or_entity, ids=msg_ids)
+        return normalize_messages(msgs)
 
     @staticmethod
     def _clamp_part_size_kb(value) -> int:

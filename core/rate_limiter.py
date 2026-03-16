@@ -1,7 +1,6 @@
 """全局速率限制器，控制转发频率，防止触发 FloodWaitError。"""
 import asyncio
 import random
-import time
 import yaml
 
 def _get_dynamic_rate_limit(fallback_config):
@@ -26,11 +25,14 @@ class RateLimiter:
         self._interval_scale = 1.0  # FloodWait 后翻倍
         self._lock = asyncio.Lock()
 
+    def _current_limits(self) -> dict:
+        """读取最新限流配置（支持运行时热更新 config.yaml）。"""
+        return _get_dynamic_rate_limit(self.fallback_config)
 
     async def wait(self):
         """每次转发前调用，自动控制速率。"""
         async with self._lock:
-            rl = _get_dynamic_rate_limit(self.fallback_config)
+            rl = self._current_limits()
             forward_interval = rl.get("forward_interval", self.forward_interval)
             batch_pause_every = rl.get("batch_pause_every", self.batch_pause_every)
             batch_pause_time = rl.get("batch_pause_time", self.batch_pause_time)
