@@ -5,7 +5,7 @@ import yaml
 
 def _get_dynamic_rate_limit(fallback_config):
     try:
-        with open("config.yaml", "r", encoding="utf-8") as f:
+        with open("config.yaml", encoding="utf-8") as f:
             c = yaml.safe_load(f)
             return c.get("rate_limit", {})
     except Exception:

@@ -282,10 +282,7 @@ class Forwarder:
 
             with tempfile.TemporaryDirectory() as tmpdir:
                 ok_items = await self._download_album_media(media_msgs, tmpdir)
-
-                ok_items.sort(key=lambda x: x[0])
-                files = [path for _, _, path in ok_items]
-                captions = [m.text or "" for _, m, _ in ok_items]
+                files, captions = self._build_album_upload_payload(ok_items)
                 if not files:
                     logger.warning("策略3相册: 媒体下载失败")
                     return []
@@ -348,6 +345,15 @@ class Forwarder:
             if path:
                 ok_items.append((index, message, path))
         return ok_items
+
+    @staticmethod
+    def _build_album_upload_payload(
+        ok_items: list[tuple[int, Message, str]]
+    ) -> tuple[list[str], list[str]]:
+        ordered_items = sorted(ok_items, key=lambda item: item[0])
+        files = [path for _, _, path in ordered_items]
+        captions = [message.text or "" for _, message, _ in ordered_items]
+        return files, captions
 
     async def _copy_message(self, client: TelegramClient, msg: Message,
                             target_chat_id: int, topic_id: int | None):

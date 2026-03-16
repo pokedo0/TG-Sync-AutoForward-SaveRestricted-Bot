@@ -167,6 +167,45 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
 
         await event.reply("❌ 消息内容为空")
 
+    async def _parse_private_link_and_source(
+        event,
+    ) -> tuple[ParsedLink, int] | None:
+        link = extract_tg_link(event.raw_text)
+        if not link:
+            return None
+
+        parsed = parse_link(link)
+        if not parsed or not parsed.msg_id:
+            await event.reply("❌ 无法解析链接，需要包含消息ID")
+            return None
+
+        source_id = await resolve_chat_id(userbot, parsed)
+        if not source_id:
+            await event.reply("❌ 无法访问该频道/群组")
+            return None
+
+        return parsed, source_id
+
+    async def _fetch_private_target_message(event, fetch_target: FetchTarget):
+        try:
+            msg = await userbot.get_messages(fetch_target.chat_id, ids=fetch_target.msg_id)
+            if not msg:
+                await event.reply("❌ 消息不存在")
+                return None
+            return msg
+        except ValueError as e:
+            if "input entity" in str(e):
+                await event.reply("❌ UserBot 未加入该私有频道/群组，无法访问")
+            else:
+                await event.reply(f"❌ 获取消息失败: {e}")
+            logger.warning("私聊解析失败: %s", e)
+        except errors.ChannelPrivateError:
+            await event.reply("❌ 该频道/群组为私有，UserBot 未加入无法访问")
+        except Exception as e:
+            logger.warning("私聊解析失败: %s", e)
+            await event.reply(f"❌ 获取消息失败: {e}")
+        return None
+
     # ------------------------------------------------------------------
     # 命令处理器
     # ------------------------------------------------------------------
@@ -453,21 +492,11 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         if not allow_public and not is_admin(event.sender_id):
             return
 
-        link = extract_tg_link(event.raw_text)
-        if not link:
+        parsed_source = await _parse_private_link_and_source(event)
+        if not parsed_source:
             return
+        parsed, source_id = parsed_source
 
-        parsed = parse_link(link)
-        if not parsed or not parsed.msg_id:
-            await event.reply("❌ 无法解析链接，需要包含消息ID")
-            return
-
-        source_id = await resolve_chat_id(userbot, parsed)
-        if not source_id:
-            await event.reply("❌ 无法访问该频道/群组")
-            return
-
-        # 获取源描述
         source_desc = await describe_source(userbot, source_id, parsed)
         comment_info = f" comment={parsed.comment_id}" if parsed.comment_id else ""
         single_info = " [single]" if parsed.single else ""
@@ -479,21 +508,8 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         if not fetch_target:
             await event.reply("❌ 无法获取频道的讨论群，评论消息无法解析")
             return
-        try:
-            msg = await userbot.get_messages(fetch_target.chat_id, ids=fetch_target.msg_id)
-            if not msg:
-                await event.reply("❌ 消息不存在")
-                return
 
-            await _forward_private_message(event, fetch_target.chat_id, msg, parsed)
-        except ValueError as e:
-            if "input entity" in str(e):
-                await event.reply("❌ UserBot 未加入该私有频道/群组，无法访问")
-            else:
-                await event.reply(f"❌ 获取消息失败: {e}")
-            logger.warning("私聊解析失败: %s", e)
-        except errors.ChannelPrivateError:
-            await event.reply("❌ 该频道/群组为私有，UserBot 未加入无法访问")
-        except Exception as e:
-            logger.warning("私聊解析失败: %s", e)
-            await event.reply(f"❌ 获取消息失败: {e}")
+        msg = await _fetch_private_target_message(event, fetch_target)
+        if not msg:
+            return
+        await _forward_private_message(event, fetch_target.chat_id, msg, parsed)

@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 
 from telethon import TelegramClient
-from telethon.tl.types import Channel, Chat
+from telethon.tl.types import Channel
 from telethon.tl.functions.channels import GetFullChannelRequest
 
 logger = logging.getLogger("tg_forward_bot.link_parser")

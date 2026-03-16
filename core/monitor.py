@@ -5,24 +5,18 @@ import logging
 from telethon import TelegramClient, events, errors
 from telethon.tl.types import MessageService
 
-from core.forwarder import Forwarder
+from core.base_component import ForwardingComponent
 from core.message_logic import is_album_candidate
-from core.rate_limiter import RateLimiter
 from db.database import Database
 from db import models
 
 logger = logging.getLogger("tg_forward_bot.monitor")
 
 
-class MonitorManager:
+class MonitorManager(ForwardingComponent):
     def __init__(self, bot: TelegramClient, userbot: TelegramClient,
                  db: Database, config: dict):
-        self.bot = bot
-        self.userbot = userbot
-        self.db = db
-        self.config = config
-        self.rl = RateLimiter(config)
-        self.forwarder = Forwarder(bot, userbot, config, self.rl)
+        super().__init__(bot, userbot, db, config)
         self._handlers: dict[int, callable] = {}
         self._album_buffers: dict[tuple[int, int], dict] = {}
 
