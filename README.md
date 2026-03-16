@@ -7,8 +7,8 @@ Telethon-based Telegram forwarding tool with a dual-client architecture (`Bot + 
 ### 1. Features
 
 - Private chat link parsing: public/private/comment/topic links
-- `/sync` for historical backfill
-- `/monitor` for real-time forwarding
+- `/sync` for historical backfill across channel, group, and group topic scopes
+- `/monitor` for real-time forwarding across channel, group, and group topic scopes
 - Automatic hard-block filtering during sync/forward:
   only filters messages/chats with cross-platform restriction (`platform=all`, e.g. `can't be displayed`);
   platform-specific restrictions (for example iOS/Android only) are still forwarded
@@ -44,8 +44,8 @@ On first run, UserBot login verification is required. Session files are stored i
 
 - `/start`: startup guide
 - `/help`: help
-- `/sync <link> [--forward]`: sync historical messages to current target
-- `/monitor <link> [--forward]`: monitor new messages and forward to current target
+- `/sync <link> [--forward]`: sync historical messages to current target (supports channel / group / group topic)
+- `/monitor <link> [--forward]`: monitor new messages and forward to current target (supports channel / group / group topic)
 - `/list`: manage tasks (pause/resume/delete/clear)
 - `/settings`: view rate-limit settings
 
