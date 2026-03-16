@@ -9,6 +9,9 @@ Telethon-based Telegram forwarding tool with a dual-client architecture (`Bot + 
 - Private chat link parsing: public/private/comment/topic links
 - `/sync` for historical backfill
 - `/monitor` for real-time forwarding
+- Automatic hard-block filtering during sync/forward:
+  only filters messages/chats with cross-platform restriction (`platform=all`, e.g. `can't be displayed`);
+  platform-specific restrictions (for example iOS/Android only) are still forwarded
 - Unified fallback pipeline with automatic downgrade
 - Supports both `copy` (default) and `forward`
 - Supports `?comment=<id>` and `?single`
@@ -77,6 +80,9 @@ Notes:
 - `forward` keeps native forwarding semantics; `copy` is often more compatible but may hit send-side limits faster.
 - For private sources, UserBot must be a member and able to read.
 - Topic delivery depends on target-side topic permissions (`target_topic_id`).
+- Hard-block filtering uses a union rule for cross-platform blocking:
+  if chat-level or message-level `restriction_reason.platform=all` is present, it is treated as blocked.
+  Restrictions limited to specific platforms are not treated as hard-blocks and will still be forwarded.
 - Albums are sent as a group first; on failure, it downgrades to per-message forwarding.
 - If you see frequent `FloodWait`, tune `rate_limit` parameters.
 

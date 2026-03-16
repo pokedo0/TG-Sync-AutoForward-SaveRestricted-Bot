@@ -9,6 +9,9 @@
 - 私聊贴链接解析：公开/私有/评论区/话题链接
 - `/sync`：历史消息同步
 - `/monitor`：实时消息监控转发
+- 同步/转发内置“硬封禁”自动过滤：
+  仅过滤全平台受限（`platform=all`，典型表现为 `can't be displayed`）的频道/群组或消息；
+  仅限部分平台（如 iOS/Android）的限制不会被过滤，仍会保留转发
 - 统一降级策略：优先低成本，失败自动兜底
 - 支持 `copy`（默认）与 `forward` 模式
 - 支持 `?comment=<id>` 与 `?single`
@@ -113,6 +116,8 @@ python main.py
 - `forward` 模式更接近原始转发；`copy` 模式更稳定但更容易触发发送限流。
 - 私有来源必须确保 UserBot 已加入并可读，否则策略2/3都会失败。
 - Topic/论坛群转发依赖 `target_topic_id`，目标侧权限不足会导致发送失败。
+- 硬封禁采用并集判定：只要 chat 级或 message 级出现 `restriction_reason.platform=all`，即视为已封禁并过滤。
+  仅在部分平台生效的限制不视为硬封禁，仍正常转发。
 - 相册会优先整组发送，失败后才降级为逐条转发。
 - 出现大量 `FloodWait` 时，建议调大 `rate_limit` 相关参数。
 
