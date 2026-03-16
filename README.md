@@ -1,134 +1,106 @@
 # TG-Sync-AutoForward-SaveRestricted-Bot
 
-基于 Telethon 的 Telegram 转发工具，采用 `Bot + UserBot` 双客户端架构，支持：
+[中文文档 (Chinese README)](./README.zh-CN.md)
 
-- 私聊贴链接解析（公开/私有/评论区/话题）
-- `/sync` 历史同步
-- `/monitor` 实时监控转发
-- 多策略降级转发（尽量低成本，失败自动兜底）
+Telethon-based Telegram forwarding tool with a dual-client architecture (`Bot + UserBot`) for link parsing, historical sync, live monitoring, and resilient fallback strategies.
 
-## 1. 功能概览
+### 1. Features
 
-- `Bot` 负责命令交互与发送（写）
-- `UserBot` 负责访问受限来源与下载（读）
-- 支持 `copy`（默认）与 `forward` 模式
-- 支持评论链接：`?comment=123`
-- 支持单条相册消息：`?single`
-- 无法转发时自动发送 `#fail2forward`
+- Private chat link parsing: public/private/comment/topic links
+- `/sync` for historical backfill
+- `/monitor` for real-time forwarding
+- Unified fallback pipeline with automatic downgrade
+- Supports both `copy` (default) and `forward`
+- Supports `?comment=<id>` and `?single`
+- Sends `#fail2forward` when all strategies fail
 
-## 2. 项目结构
+### 2. Architecture
 
-```text
-TG-Sync-AutoForward-SaveRestricted-Bot/
-├── main.py
-├── config.example.yaml
-├── bot/
-│   ├── handlers.py
-│   ├── link_parser.py
-│   └── telegram_utils.py
-├── core/
-│   ├── forwarder.py
-│   ├── message_logic.py
-│   ├── monitor.py
-│   ├── rate_limiter.py
-│   └── syncer.py
-├── db/
-│   ├── database.py
-│   └── models.py
-└── docs/
-    ├── architecture.md
-    └── operations.md
-```
+- `Bot`: command entrypoint and target-side sending (write)
+- `UserBot`: restricted-source reading and media download (read)
+- Principle: `UserBot reads, Bot writes` whenever possible
 
-## 3. 环境要求
+### 3. Requirements
 
 - Python 3.11+
 - Telegram `api_id` / `api_hash`
-- 一个 Bot Token
-- 一个 UserBot 账号（手机号登录）
+- One Bot token
+- One UserBot account (phone login)
 
-## 4. 快速启动
-
-1. 安装依赖
+### 4. Quick Start
 
 ```bash
 pip install -r requirements.txt
-```
-
-2. 复制并编辑配置
-
-```bash
 cp config.example.yaml config.yaml
-```
-
-3. 启动
-
-```bash
 python main.py
 ```
 
-首次启动会要求 UserBot 完成登录验证码验证，成功后会在 `sessions/` 下保存会话。
+On first run, UserBot login verification is required. Session files are stored in `sessions/`.
 
-## 5. 配置说明
+### 5. Commands
 
-参考 `config.example.yaml`：
+- `/start`: startup guide
+- `/help`: help
+- `/sync <link> [--forward]`: sync historical messages to current target
+- `/monitor <link> [--forward]`: monitor new messages and forward to current target
+- `/list`: manage tasks (pause/resume/delete/clear)
+- `/settings`: view rate-limit settings
 
-- `api_id` / `api_hash`: Telegram API 凭证
-- `bot_token`: Bot token
-- `phone`: UserBot 手机号（国际格式）
-- `admin_ids`: 管理员用户 ID 列表
-- `allow_public_resolve`: 是否允许非管理员私聊解析链接
-- `rate_limit`: 速率与 FloodWait 退避参数
+Sending a `t.me/...` link in private chat triggers parsing and forwarding.
 
-## 6. 命令说明
+### 6. Forwarding Strategy (Priority Rules)
 
-- `/start`: 启动说明
-- `/help`: 帮助
-- `/sync <链接> [--forward]`: 同步历史消息到当前群/频道
-- `/monitor <链接> [--forward]`: 监控新消息转发到当前群/频道
-- `/list`: 任务管理（暂停/恢复/删除/清空）
-- `/settings`: 查看限流配置
+Runtime fallback order is always `1 -> 2 -> 3 -> 4`:
 
-私聊直接贴 `t.me` 链接会触发解析与转发。
+1. Strategy 1: Bot direct handling (highest priority)
+2. Strategy 2: UserBot reads, then forward/copy
+3. Strategy 3: UserBot downloads, Bot re-uploads
+4. Strategy 4: fail marker `#fail2forward`
 
-## 7. 转发策略
+Operational priority interpretation:
 
-单条消息与相册都使用同一套降级策略：
+- Priority A (best chance to stay on Strategy 1):
+  Bot can send in target group/channel and is admin (private or public target).
+- Priority B (often still Strategy 1):
+  Source is a public channel/group, so Bot can usually read directly.
+- Priority C (often downgraded to Strategy 3):
+  Source is a private discussion group (comment area), or source has protected/no-forward content enabled.
 
-1. 策略1：Bot 直接转发/复制
-2. 策略2：UserBot 读取后由 Bot 转发/复制
-3. 策略3：UserBot 下载再由 Bot 上传
-4. 策略4：发送失败标记（`#fail2forward`）
+Notes:
 
-说明：日志中的“策略1成功”表示“第一层尝试成功”，不一定是原生 `forward`。在 `copy` 模式下可能是 `send_file/send_message`。
+- `Strategy 1 success` in logs means the first layer succeeded, not necessarily native `forward`.
+- In `copy` mode, Strategy 1 may internally use `send_message/send_file`.
+- `?comment=` links point to messages in linked discussion groups, not in the channel post itself.
 
-## 8. 私有来源与评论区
+### 7. Additional Notes
 
-- 公开频道主贴：Bot 常可直接处理
-- 私有频道/群组：通常依赖 UserBot 读取
-- 评论区链接 `?comment=`：实际消息在 discussion 群里；若 discussion 是私有，常会降级到策略3
+- `forward` keeps native forwarding semantics; `copy` is often more compatible but may hit send-side limits faster.
+- For private sources, UserBot must be a member and able to read.
+- Topic delivery depends on target-side topic permissions (`target_topic_id`).
+- Albums are sent as a group first; on failure, it downgrades to per-message forwarding.
+- If you see frequent `FloodWait`, tune `rate_limit` parameters.
 
-## 9. Docker 运行
+### 8. Docker
 
 ```bash
 docker compose up -d --build
 ```
 
-挂载目录：
+Volume mounts:
 
 - `./config.yaml` -> `/app/config.yaml`
 - `./data` -> `/app/data`
 - `./sessions` -> `/app/sessions`
 
-## 10. 日志排查
+### 9. Logs and Troubleshooting
 
-关键 logger：
+Main loggers:
 
-- `tg_forward_bot.handlers`: 命令与私聊解析入口
-- `tg_forward_bot.link_parser`: 链接解析与 discussion 解析
-- `tg_forward_bot.forwarder`: 策略执行与降级
-- `tg_forward_bot.syncer`: 历史同步进度
-- `tg_forward_bot.monitor`: 实时监控事件
+- `tg_forward_bot.handlers`
+- `tg_forward_bot.link_parser`
+- `tg_forward_bot.forwarder`
+- `tg_forward_bot.syncer`
+- `tg_forward_bot.monitor`
 
-更多运行细节见 `docs/operations.md`。
+See `docs/operations.md` and `docs/architecture.md` for deeper operational details.
 
