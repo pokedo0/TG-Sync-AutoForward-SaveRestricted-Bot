@@ -54,6 +54,19 @@ class Syncer(ForwardingComponent):
             return True
         return False
 
+    @staticmethod
+    def _is_general_topic_msg(msg) -> bool:
+        """判断消息是否属于 General 话题（无 reply_to 或不指向其他话题）。"""
+        reply_to = getattr(msg, "reply_to", None)
+        if not reply_to:
+            return True
+        top_id = getattr(reply_to, "reply_to_top_id", None)
+        if top_id:
+            return top_id == 1
+        if getattr(reply_to, "forum_topic", False):
+            return getattr(reply_to, "reply_to_msg_id", None) in (1, None)
+        return True
+
     async def _collect_messages(
         self,
         task_id: int,
@@ -63,16 +76,21 @@ class Syncer(ForwardingComponent):
         notify: Callable[[str], Awaitable[None]],
     ) -> list | None:
         all_msgs = []
+        # General 话题 (id=1) 的消息不携带 reply_to 指向话题 1，
+        # iter_messages(reply_to=1) 无法获取，需遍历全部消息后客户端过滤。
+        iter_reply_to = None if source_topic_id == 1 else source_topic_id
         try:
             async for msg in self.userbot.iter_messages(
                 source_chat_id,
                 reverse=True,
                 offset_id=offset_id,
-                reply_to=source_topic_id,
+                reply_to=iter_reply_to,
             ):
                 if self._cancel_flags.get(task_id):
                     break
                 if isinstance(msg, MessageService):
+                    continue
+                if source_topic_id == 1 and not self._is_general_topic_msg(msg):
                     continue
                 all_msgs.append(msg)
         except Exception as error:

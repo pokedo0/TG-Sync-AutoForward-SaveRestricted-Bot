@@ -131,6 +131,11 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             if name and name != fallback:
                 return name
 
+        # General 话题 (id=1) 没有对应的 messageActionTopicCreate 服务消息，
+        # 不能用 get_messages(ids=1) 回退，否则会取到第一条用户消息的文本。
+        if topic_id == 1:
+            return "General"
+
         # 非 forum 场景（评论区线程/普通线程）也可能带 top_msg_id。
         thread_clients = [bot, userbot] if prefer_bot else [userbot, bot]
         for client in thread_clients:
@@ -151,8 +156,6 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             if text:
                 return truncate(text.splitlines()[0], 20)
 
-        if topic_id == 1:
-            return "General"
         return "未知线程"
 
     async def _describe_source_for_display(source_id: int, parsed: ParsedLink) -> str:

@@ -33,10 +33,25 @@ class MonitorManager(ForwardingComponent):
 
     @staticmethod
     def _match_source_topic(message, source_topic_id: int | None) -> bool:
-        """判断消息是否属于指定 source topic。"""
+        """判断消息是否属于指定 source topic。
+
+        General 话题 (id=1) 特殊处理：Telegram API 中 General 话题的消息
+        不携带 reply_to 指向话题 1，行为与普通群消息一致。因此判断逻辑为
+        "不属于任何其他话题的消息即属于 General 话题"。
+        """
         if not source_topic_id:
             return True
         reply_to = getattr(message, "reply_to", None)
+        if source_topic_id == 1:
+            # General 话题：无 reply_to 或 reply_to 不指向其他话题
+            if not reply_to:
+                return True
+            top_id = getattr(reply_to, "reply_to_top_id", None)
+            if top_id:
+                return top_id == 1
+            if getattr(reply_to, "forum_topic", False):
+                return getattr(reply_to, "reply_to_msg_id", None) in (1, None)
+            return True
         if not reply_to:
             return False
         top_msg_id = (

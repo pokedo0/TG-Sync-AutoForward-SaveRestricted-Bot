@@ -6,14 +6,22 @@ and other display-related helpers extracted from handlers.py.
 
 from __future__ import annotations
 
+import logging
+
 from telethon import TelegramClient
 from telethon.tl.types import Channel
 try:
     from telethon.tl.functions.channels import GetForumTopicsByIDRequest
 except ImportError:
     from telethon.tl.functions.messages import GetForumTopicsByIDRequest
+try:
+    from telethon.tl.functions.channels import GetForumTopicsRequest
+except ImportError:
+    from telethon.tl.functions.messages import GetForumTopicsRequest
 
 from bot.link_parser import ParsedLink
+
+logger = logging.getLogger("tg_forward_bot.telegram_utils")
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +66,19 @@ async def resolve_topic_name(
             return result.topics[0].title
     except Exception:
         pass
+    # GetForumTopicsByIDRequest 对 General 话题 (id=1) 可能失败，
+    # 回退到 GetForumTopicsRequest 列表中查找。
+    if topic_id == 1:
+        try:
+            result = await client(GetForumTopicsRequest(
+                channel=chat_id, offset_date=0, offset_id=0,
+                offset_topic=0, limit=100,
+            ))
+            for t in result.topics:
+                if getattr(t, "id", None) == 1:
+                    return t.title
+        except Exception:
+            pass
     return f"#{topic_id}"
 
 
