@@ -60,13 +60,21 @@ def _is_private_topic_link(url: str) -> bool:
 
 def _ensure_out_path(path: Path | None, input_link: str) -> Path:
     if path:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        return path
+        resolved = path if path.is_absolute() else project_root / path
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        return resolved
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     slug = re.sub(r"[^a-zA-Z0-9]+", "_", input_link).strip("_")[:80] or "tg_dump"
-    out = Path("test") / "dumps" / f"{stamp}_{slug}.jsonl"
+    out = project_root / "test" / "dumps" / f"{stamp}_{slug}.jsonl"
     out.parent.mkdir(parents=True, exist_ok=True)
     return out
+
+
+def _resolve_config_path(raw_path: str) -> Path:
+    path = Path(raw_path)
+    if path.is_absolute():
+        return path
+    return project_root / path
 
 
 async def dump_link(link: str, config_path: Path, out_path: Path) -> dict[str, Any]:
@@ -87,7 +95,9 @@ async def dump_link(link: str, config_path: Path, out_path: Path) -> dict[str, A
         parsed.topic_id = parsed.msg_id
         parsed.msg_id = None
 
-    client = TelegramClient("sessions/userbot", api_id, api_hash)
+    session_path = project_root / "sessions" / "userbot"
+    session_path.parent.mkdir(parents=True, exist_ok=True)
+    client = TelegramClient(str(session_path), api_id, api_hash)
     await client.start(phone=phone)
     try:
         source_chat_id = await resolve_chat_id(client, parsed)
@@ -186,9 +196,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 async def _main() -> int:
     args = build_parser().parse_args()
+    config_path = _resolve_config_path(args.config)
     out_path = _ensure_out_path(Path(args.out) if args.out else None, args.link)
     try:
-        result = await dump_link(args.link, Path(args.config), out_path)
+        result = await dump_link(args.link, config_path, out_path)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     except Exception as e:

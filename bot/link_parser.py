@@ -25,6 +25,8 @@ class ParsedLink:
 
 
 # 公开频道/群组: https://t.me/channel 或 https://t.me/channel/123
+_PUBLIC_TOPIC_MSG_RE = re.compile(
+    r"https?://t\.me/([a-zA-Z_]\w{3,})/(\d+)/(\d+)")
 _PUBLIC_MSG_RE = re.compile(
     r"https?://t\.me/([a-zA-Z_]\w{3,})/(\d+)")
 _PUBLIC_CHAT_RE = re.compile(
@@ -72,6 +74,16 @@ def parse_link(url: str) -> ParsedLink | None:
             return ParsedLink(
                 chat_id=-1000000000000 - chat_id,
                 is_private=True, single=is_single)
+
+    # 公开频道带消息 ID: /channel/123
+    m = _PUBLIC_TOPIC_MSG_RE.match(url)
+    if m:
+        return ParsedLink(
+            chat_id=m.group(1),
+            topic_id=int(m.group(2)),
+            msg_id=int(m.group(3)),
+            comment_id=comment_id,
+            is_private=False, single=is_single)
 
     # 公开频道带消息 ID: /channel/123
     m = _PUBLIC_MSG_RE.match(url)
