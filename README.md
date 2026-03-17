@@ -45,13 +45,28 @@ On first run, UserBot login verification is required. Session files are stored i
 - `/start`: startup guide
 - `/help`: help
 - `/sync <link> [--forward]`: sync historical messages to current target (supports channel / group / group topic)
-- `/monitor <link> [--forward]`: monitor new messages and forward to current target (supports channel / group / group topic)
+- `/monitor <link> [--forward]`: monitor new messages and forward to current target (supports channel / group / group topic; requires UserBot to join source first)
 - `/list`: manage tasks (pause/resume/delete/clear)
 - `/settings`: view rate-limit settings
 
 Sending a `t.me/...` link in private chat triggers parsing and forwarding.
 
-### 6. Forwarding Strategy (Priority Rules)
+### 6. Source-Type Permission Matrix
+
+| Source Type | Bot Requirement / Role | UserBot Requirement (`/sync`) | UserBot Requirement (`/monitor`) |
+|--|--|--|--|
+| Public Channel | Bot sends to target; source may be readable directly by Bot | Usually no join required (readable is enough) | **Must join** |
+| Private Channel | Bot usually cannot read source directly | Must be joined and readable | **Must be joined and readable** |
+| Public Group | Bot sends to target; source may be readable directly by Bot | Usually no join required (readable is enough) | **Must join** |
+| Private Group | Bot usually cannot read source directly | Must be joined and readable | **Must be joined and readable** |
+| Group Topic (Forum Topic) | Bot sends into target topic/thread | Must be able to read the group, then fetch by `source_topic_id` | **Must join** |
+
+Notes:
+
+- `/monitor` validates whether UserBot has joined and can access the source before task creation.
+- `/sync` usually does not require UserBot to pre-join public sources, but private/restricted sources still require UserBot access.
+
+### 7. Forwarding Strategy (Priority Rules)
 
 Runtime fallback order is always `1 -> 2 -> 3 -> 4`:
 
@@ -75,7 +90,7 @@ Notes:
 - In `copy` mode, Strategy 1 may internally use `send_message/send_file`.
 - `?comment=` links point to messages in linked discussion groups, not in the channel post itself.
 
-### 7. Additional Notes
+### 8. Additional Notes
 
 - `forward` keeps native forwarding semantics; `copy` is often more compatible but may hit send-side limits faster.
 - For private sources, UserBot must be a member and able to read.
@@ -86,7 +101,7 @@ Notes:
 - Albums are sent as a group first; on failure, it downgrades to per-message forwarding.
 - If you see frequent `FloodWait`, tune `rate_limit` parameters.
 
-### 8. Docker
+### 9. Docker
 
 ```bash
 docker compose up -d --build
@@ -98,7 +113,7 @@ Volume mounts:
 - `./data` -> `/app/data`
 - `./sessions` -> `/app/sessions`
 
-### 9. Logs and Troubleshooting
+### 10. Logs and Troubleshooting
 
 Main loggers:
 

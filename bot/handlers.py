@@ -4,6 +4,7 @@ import logging
 
 from telethon import TelegramClient, events, errors, Button
 from telethon.tl import types
+from telethon.tl.functions.channels import GetParticipantRequest
 
 from bot.link_parser import (
     ParsedLink,
@@ -18,7 +19,7 @@ from bot.handler_common import (
     extract_tg_link,
 )
 from bot.telegram_utils import (
-    resolve_chat_name, resolve_topic_name, describe_source,
+    resolve_topic_name, describe_source,
     get_target_topic_id, build_source_link, truncate,
 )
 from core.message_logic import (
@@ -116,14 +117,181 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             return None
         return ParsedSource(parsed=parsed, source_id=source_id, mode=mode)
 
-    async def _format_target_topic(target_chat_id: int,
-                                   target_topic_id: int | None) -> str:
-        """格式化目标话题信息。"""
-        if not target_topic_id:
+    async def _resolve_topic_display_name(
+        chat_id: int, topic_id: int | None, *, prefer_bot: bool = False
+    ) -> str:
+        """解析话题/线程名称，优先论坛话题名，失败回退线程顶层消息。"""
+        if not topic_id:
             return ""
-        name = await resolve_topic_name(userbot, target_chat_id,
-                                        target_topic_id)
-        return f"\n📍 目标话题:「{name}」"
+
+        fallback = f"#{topic_id}"
+        forum_clients = [userbot] if prefer_bot else [userbot, bot]
+        for client in forum_clients:
+            name = await resolve_topic_name(client, chat_id, topic_id)
+            if name and name != fallback:
+                return name
+
+        # 非 forum 场景（评论区线程/普通线程）也可能带 top_msg_id。
+        thread_clients = [bot, userbot] if prefer_bot else [userbot, bot]
+        for client in thread_clients:
+            try:
+                top_msg = await client.get_messages(chat_id, ids=topic_id)
+            except Exception:
+                continue
+            if not top_msg:
+                continue
+            action = getattr(top_msg, "action", None)
+            action_title = getattr(action, "title", None) if action else None
+            if action_title:
+                return action_title
+            raw = (getattr(top_msg, "raw_text", None) or "").strip()
+            if raw:
+                return truncate(raw.splitlines()[0], 20)
+            text = (getattr(top_msg, "message", None) or "").strip()
+            if text:
+                return truncate(text.splitlines()[0], 20)
+
+        if topic_id == 1:
+            return "General"
+        return "未知线程"
+
+    async def _describe_source_for_display(source_id: int, parsed: ParsedLink) -> str:
+        """构造源描述，确保话题展示优先使用真实名称。"""
+        source_desc = await describe_source(userbot, source_id, parsed)
+        if not parsed.topic_id:
+            return source_desc
+        topic_name = await _resolve_topic_display_name(source_id, parsed.topic_id)
+        return source_desc.replace(
+            f"话题「#{parsed.topic_id}」",
+            f"话题「{topic_name}」",
+        )
+
+    async def _resolve_chat_meta(
+        client: TelegramClient, chat_id: int
+    ) -> tuple[str, str, str]:
+        """解析实体元信息: (kind, visibility, name)。"""
+        try:
+            entity = await client.get_entity(chat_id)
+            if isinstance(entity, types.Channel):
+                kind = "频道" if getattr(entity, "broadcast", False) else "群组"
+                username = getattr(entity, "username", None)
+                if username:
+                    return kind, "公开", f"@{username}"
+                title = getattr(entity, "title", None) or str(chat_id)
+                return kind, "私有", title
+
+            title = getattr(entity, "title", None)
+            if title:
+                return "群组", "", title
+            first_name = getattr(entity, "first_name", None)
+            if first_name:
+                return "群组", "", first_name
+        except Exception:
+            pass
+        return "频道/群组", "", str(chat_id)
+
+    async def _format_chat_topic_display(
+        chat_id: int,
+        topic_id: int | None,
+        *,
+        prefer_bot: bool = False,
+        short: bool = False,
+    ) -> str:
+        """统一格式化: 频道/群组 + 话题。"""
+        clients = [bot, userbot] if prefer_bot else [userbot, bot]
+        kind, visibility, name = "频道/群组", "", str(chat_id)
+        for client in clients:
+            kind, visibility, name = await _resolve_chat_meta(client, chat_id)
+            if name != str(chat_id):
+                break
+
+        if short:
+            base = f"{kind[:1]}:{truncate(name, 12)}"
+        else:
+            vis_part = f"{visibility} " if visibility else ""
+            base = f"{kind} | {vis_part}{name}"
+
+        if topic_id:
+            topic_name = await _resolve_topic_display_name(
+                chat_id, topic_id, prefer_bot=prefer_bot
+            )
+            if short:
+                base += f"/{truncate(topic_name, 8)}"
+            else:
+                base += f" + 话题「{topic_name}」"
+        return base
+
+    async def _ensure_userbot_joined_source_for_monitor(
+        source_chat_id: int, source_topic_id: int | None
+    ) -> tuple[bool, str | None]:
+        """校验 monitor 前提: userbot 已加入源。"""
+        try:
+            entity = await userbot.get_entity(source_chat_id)
+        except (ValueError, errors.ChannelPrivateError):
+            source_text = await _format_chat_topic_display(
+                source_chat_id, source_topic_id
+            )
+            return (
+                False,
+                "❌ /monitor 要求 UserBot 必须先加入源后才会生效。\n"
+                f"📌 源: {source_text}\n"
+                "请先让 UserBot 加入该源，再执行 /monitor。",
+            )
+        except Exception as e:
+            logger.warning("校验 userbot 源加入状态失败 source=%s err=%s", source_chat_id, e)
+            source_text = await _format_chat_topic_display(
+                source_chat_id, source_topic_id
+            )
+            return (
+                False,
+                "❌ 无法确认 UserBot 对源的可访问性，请先确保 UserBot 已加入源。\n"
+                f"📌 源: {source_text}",
+            )
+
+        # Channel/超级群走参与者校验；其它会话默认放行。
+        if not isinstance(entity, types.Channel):
+            return True, None
+
+        try:
+            me = await userbot.get_me()
+            await userbot(GetParticipantRequest(channel=entity, participant=me.id))
+            return True, None
+        except errors.UserNotParticipantError:
+            source_text = await _format_chat_topic_display(
+                source_chat_id, source_topic_id
+            )
+            return (
+                False,
+                "❌ /monitor 未生效：UserBot 尚未加入源。\n"
+                f"📌 源: {source_text}\n"
+                "请先让 UserBot 加入该频道/群组后，再执行 /monitor。",
+            )
+        except errors.ChannelPrivateError:
+            source_text = await _format_chat_topic_display(
+                source_chat_id, source_topic_id
+            )
+            return (
+                False,
+                "❌ /monitor 未生效：源为私有且 UserBot 无访问权限。\n"
+                f"📌 源: {source_text}\n"
+                "请先让 UserBot 加入该源后重试。",
+            )
+        except Exception as e:
+            logger.warning("GetParticipant 校验失败 source=%s err=%s", source_chat_id, e)
+            # 某些场景参与者列表受限，回退到读取探测。
+            try:
+                await userbot.get_messages(source_chat_id, limit=1)
+                return True, None
+            except Exception:
+                source_text = await _format_chat_topic_display(
+                    source_chat_id, source_topic_id
+                )
+                return (
+                    False,
+                    "❌ /monitor 要求 UserBot 可读取源消息，但当前不可读。\n"
+                    f"📌 源: {source_text}\n"
+                    "请先让 UserBot 加入该源后重试。",
+                )
 
     async def _stop_running_task(task: dict):
         """停止一个运行中的任务（sync 或 monitor）。"""
@@ -137,22 +305,16 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             await monitor_manager.stop_monitor(tid)
 
     async def _build_task_buttons(tasks: list) -> list:
-        """为任务列表构建 inline button 行。"""
+        """为任务列表构建单列 inline button。"""
         buttons = []
         for t in tasks:
             emoji = "🔄" if t["type"] == "sync" else "👁"
             status = STATUS_EMOJI.get(t["status"], "❓")
-            src_name = truncate(
-                await resolve_chat_name(userbot, t["source_chat_id"]), 20)
-            topic_part = ""
-            if t["source_topic_id"]:
-                topic_name = truncate(
-                    await resolve_topic_name(
-                        userbot, t["source_chat_id"], t["source_topic_id"]),
-                    12)
-                topic_part = f"/{topic_name}"
-            label = f"{status}{emoji} #{t['id']} {src_name}{topic_part}"
-            buttons.append([Button.inline(label, data=f"task:{t['id']}")])
+            src = await _format_chat_topic_display(
+                t["source_chat_id"], t["source_topic_id"], short=True
+            )
+            label = f"{status}{emoji} #{t['id']} {src}"
+            buttons.append([Button.inline(truncate(label, 48), data=f"task:{t['id']}")])
         buttons.append([Button.inline("🗑 清空所有任务", data="clear_all")])
         return buttons
 
@@ -253,7 +415,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             "功能:\n"
             "• 私聊发链接 → 解析受限内容\n"
             "• /sync <链接> → 同步历史消息到当前群\n"
-            "• /monitor <链接> → 监控新消息转发到当前群\n"
+            "• /monitor <链接> → 监控新消息转发到当前群（需 UserBot 先加入源）\n"
             "• /list → 管理所有任务\n"
             "• /settings → 查看配置")
 
@@ -262,7 +424,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         await event.reply(
             "📖 使用说明:\n\n"
             "/sync <链接> [--forward] — 同步源历史到当前群\n"
-            "/monitor <链接> [--forward] — 监控源新消息到当前群\n"
+            "/monitor <链接> [--forward] — 监控源新消息到当前群（要求 UserBot 已加入源）\n"
             "/list — 管理所有任务（含暂停/恢复/删除）\n"
             "/settings — 查看限流配置\n\n"
             "链接格式:\n"
@@ -294,13 +456,16 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
 
         rl = _get_dynamic_rate_limit(config)
         interval = rl.get("forward_interval", [2, 5])
-        source_desc = await describe_source(userbot, source_id, parsed)
-        topic_info = await _format_target_topic(target_chat_id, target_topic_id)
+        source_desc = await _format_chat_topic_display(source_id, parsed.topic_id)
+        target_desc = await _format_chat_topic_display(
+            target_chat_id, target_topic_id, prefer_bot=True
+        )
         start_msg = await event.reply(
             f"🚀 同步任务 #{task_id} 已创建\n"
             f"📌 源: {source_desc}\n"
+            f"🎯 目标: {target_desc}\n"
             f"⏱ 转发间隔: {interval[0]}-{interval[1]}秒/条\n"
-            f"📋 模式: {mode}{topic_info}")
+            f"📋 模式: {mode}")
 
         task = asyncio.create_task(syncer.start_sync(
             task_id, source_id, target_chat_id, mode,
@@ -326,6 +491,13 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
 
         target_chat_id = event.chat_id
         target_topic_id = get_target_topic_id(event)
+        ok, reason = await _ensure_userbot_joined_source_for_monitor(
+            source_id, parsed.topic_id
+        )
+        if not ok:
+            await event.reply(reason)
+            return
+
         logger.info("创建监控任务: source=%s topic=%s -> target=%s target_topic=%s mode=%s",
                      source_id, parsed.topic_id, target_chat_id, target_topic_id, mode)
         task_id = await models.create_task(
@@ -338,13 +510,17 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             source_topic_id=parsed.topic_id,
             target_topic_id=target_topic_id)
 
-        source_desc = await describe_source(userbot, source_id, parsed)
-        topic_info = await _format_target_topic(target_chat_id, target_topic_id)
+        source_desc = await _format_chat_topic_display(source_id, parsed.topic_id)
+        target_desc = await _format_chat_topic_display(
+            target_chat_id, target_topic_id, prefer_bot=True
+        )
         logger.info("监控任务 #%s 已启动", task_id)
         await event.reply(
             f"👁 监控任务 #{task_id} 已启动\n"
             f"📌 源: {source_desc}\n"
-            f"📋 模式: {mode}{topic_info}")
+            f"🎯 目标: {target_desc}\n"
+            "✅ 已校验 UserBot 可访问该源\n"
+            f"📋 模式: {mode}")
 
     @bot.on(events.NewMessage(pattern=r"/list(?:@\w+)?$"))
     async def on_list(event):
@@ -369,21 +545,13 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         emoji = "🔄" if t["type"] == "sync" else "👁"
         status = STATUS_EMOJI.get(t["status"], "❓")
 
-        # 解析源名称
-        src_name = await resolve_chat_name(userbot, t["source_chat_id"])
-        src_topic = ""
-        if t["source_topic_id"]:
-            topic_name = await resolve_topic_name(
-                userbot, t["source_chat_id"], t["source_topic_id"])
-            src_topic = f" →「{topic_name}」"
-
-        # 解析目标名称
-        tgt_name = await resolve_chat_name(bot, t["target_chat_id"])
-        tgt_topic = ""
-        if t["target_topic_id"]:
-            topic_name = await resolve_topic_name(
-                userbot, t["target_chat_id"], t["target_topic_id"])
-            tgt_topic = f" →「{topic_name}」"
+        # 解析源/目标完整信息（频道/群组 + 话题）。
+        src_desc = await _format_chat_topic_display(
+            t["source_chat_id"], t["source_topic_id"]
+        )
+        tgt_desc = await _format_chat_topic_display(
+            t["target_chat_id"], t["target_topic_id"], prefer_bot=True
+        )
 
         source_link = build_source_link(t["source_chat_id"],
                                          t["source_topic_id"])
@@ -392,8 +560,8 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             f"{emoji} 任务 #{t['id']}\n"
             f"类型: {t['type']} | 模式: {t['mode']}\n"
             f"状态: {status} {t['status']}\n"
-            f"源: {src_name}{src_topic}\n"
-            f"目标: {tgt_name}{tgt_topic}")
+            f"源: {src_desc}\n"
+            f"目标: {tgt_desc}")
 
         buttons = []
         if source_link:
@@ -446,6 +614,15 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             return
         if t["type"] != "monitor":
             await event.answer("仅支持恢复监控任务", alert=True)
+            return
+
+        ok, reason = await _ensure_userbot_joined_source_for_monitor(
+            t["source_chat_id"], t["source_topic_id"]
+        )
+        if not ok:
+            alert_text = truncate(reason.replace("\n", " "), 80) if reason else "UserBot 未加入源，无法恢复"
+            await event.answer(alert_text, alert=True)
+            await _show_task_detail(event, task_id)
             return
 
         await models.update_task_status(db, task_id, "running")
@@ -533,7 +710,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             return
         parsed, source_id = parsed_source
 
-        source_desc = await describe_source(userbot, source_id, parsed)
+        source_desc = await _describe_source_for_display(source_id, parsed)
         comment_info = f" comment={parsed.comment_id}" if parsed.comment_id else ""
         single_info = " [single]" if parsed.single else ""
         logger.info("私聊解析: user=%s 源=%s msg=%s%s%s",
