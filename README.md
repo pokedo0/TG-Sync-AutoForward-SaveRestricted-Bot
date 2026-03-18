@@ -1,107 +1,80 @@
-# TG-Sync-AutoForward-SaveRestricted-Bot
+# TG Forward Bot
 
-[中文文档 (Chinese README)](./README.zh-CN.md)
+[中文文档](./README.zh-CN.md)
 
-Telethon-based Telegram forwarding tool with a dual-client architecture (`Bot + UserBot`) for link parsing, historical sync, live monitoring, and resilient fallback strategies.
+A Telethon-based Telegram message forwarding tool with a **Bot + UserBot** dual-client architecture. Supports link parsing, historical message sync, real-time monitoring, and multi-strategy graceful degradation.
 
-### 1. Features
+## Features
 
-- Private chat link parsing: public/private/comment/topic links
-- `/sync` for historical backfill across channel, group, and group topic scopes
-- `/monitor` for real-time forwarding across channel, group, and group topic scopes
-- Automatic hard-block filtering during sync/forward:
-  only filters messages/chats with cross-platform restriction (`platform=all`, e.g. `can't be displayed`);
-  platform-specific restrictions (for example iOS/Android only) are still forwarded
-- Unified fallback pipeline with automatic downgrade
-- Supports both `copy` (default) and `forward`
-- Supports `?comment=<id>` and `?single`
-- Sends `#fail2forward` when all strategies fail
+- **Link Parsing** — Send a `t.me/...` link in private chat to trigger forwarding; supports public/private channels, groups, comments, and forum topics
+- **Historical Sync** — `/sync` pulls past messages with resumable progress tracking
+- **Real-Time Monitoring** — `/monitor` watches for new messages and forwards them automatically
+- **Graceful Degradation** — Bot direct → UserBot-assisted → download & re-upload → failure marker `#fail2forward`
+- **Album-Aware** — Sends media groups as a batch first, falls back to per-message on failure
+- **Hard-Block Filtering** — Automatically skips globally restricted content (`platform=all`); platform-specific restrictions are still forwarded
+- **Dual Mode** — Supports both `copy` (default) and `forward` transfer modes
 
-### 2. Architecture
+## Architecture
 
-- `Bot`: command entrypoint and target-side sending (write)
-- `UserBot`: restricted-source reading and media download (read)
-- Principle: `UserBot reads, Bot writes` whenever possible
+| Role | Responsibility |
+|------|----------------|
+| **Bot** | Command handling, target-side delivery (write) |
+| **UserBot** | Restricted-source access, media download (read) |
 
-### 3. Requirements
+Design principle: **UserBot reads, Bot writes** — UserBot only participates in write operations when necessary.
+
+## Prerequisites
 
 - Python 3.11+
-- Telegram `api_id` / `api_hash`
-- One Bot token
-- One UserBot account (phone login)
+- Telegram `api_id` / `api_hash` ([my.telegram.org](https://my.telegram.org))
+- Bot Token ([@BotFather](https://t.me/BotFather))
+- A UserBot account (phone number login)
 
-### 4. Quick Start
+## Getting Started
 
 ```bash
 pip install -r requirements.txt
-cp config.example.yaml config.yaml
+cp config.example.yaml config.yaml   # Fill in your credentials
 python main.py
 ```
 
-On first run, UserBot login verification is required. Session files are stored in `sessions/`.
+> On first launch, UserBot phone verification is required. Session files are persisted in `sessions/`.
 
-### 5. Commands
+## Commands
 
-- `/start`: startup guide
-- `/help`: help
-- `/sync <link> [--forward]`: sync historical messages to current target (supports channel / group / group topic)
-- `/monitor <link> [--forward]`: monitor new messages and forward to current target (supports channel / group / group topic; requires UserBot to join source first)
-- `/list`: manage tasks (pause/resume/delete/clear)
-- `/settings`: view rate-limit settings
+| Command | Description |
+|---------|-------------|
+| `/sync <link> [--forward]` | Sync historical messages to the current chat (channel / group / topic) |
+| `/monitor <link> [--forward]` | Monitor new messages and forward to the current chat (UserBot must have joined the source) |
+| `/list` | Task management: pause / resume / delete / clear |
+| `/settings` | View rate-limit configuration |
+| `/start` · `/help` | Startup guide and help |
 
-Sending a `t.me/...` link in private chat triggers parsing and forwarding.
+Sending a `t.me/...` link in a private chat with the bot triggers parsing and forwarding.
 
-### 6. Source-Type Permission Matrix
+## Source Access Requirements
 
-| Source Type | Bot Requirement / Role | UserBot Requirement (`/sync`) | UserBot Requirement (`/monitor`) |
-|--|--|--|--|
-| Public Channel | Bot sends to target; source may be readable directly by Bot | Usually no join required (readable is enough) | **Must join** |
-| Private Channel | Bot usually cannot read source directly | Must be joined and readable | **Must be joined and readable** |
-| Public Group | Bot sends to target; source may be readable directly by Bot | Usually no join required (readable is enough) | **Must join** |
-| Private Group | Bot usually cannot read source directly | Must be joined and readable | **Must be joined and readable** |
-| Group Topic (Forum Topic) | Bot sends into target topic/thread | Must be able to read the group, then fetch by `source_topic_id` | **Must join** |
+| Source Type | UserBot for `/sync` | UserBot for `/monitor` |
+|-------------|---------------------|------------------------|
+| Public channel / group | Usually no membership required | **Must be a member** |
+| Private channel / group | Must be a member with read access | **Must be a member with read access** |
+| Forum topic | Must have read access to the group | **Must be a member** |
 
-Notes:
+- `/monitor` validates UserBot membership and access before creating a task; the task is rejected if requirements are not met.
+- Bot always handles target-side delivery; source-side readability depends on whether the source is public.
 
-- `/monitor` validates whether UserBot has joined and can access the source before task creation.
-- `/sync` usually does not require UserBot to pre-join public sources, but private/restricted sources still require UserBot access.
+## Forwarding Strategy
 
-### 7. Forwarding Strategy (Priority Rules)
+The runtime always attempts strategies in order, falling back automatically on failure:
 
-Runtime fallback order is always `1 -> 2 -> 3 -> 4`:
+1. **Bot Direct** — Lowest cost; preferred when Bot can read the source
+2. **UserBot-Assisted** — UserBot reads the source, Bot delivers
+3. **Download & Re-upload** — UserBot downloads media, Bot re-uploads (used when content is protected or forwarding is restricted)
+4. **Failure Marker** — Sends `#fail2forward` when all strategies are exhausted
 
-1. Strategy 1: Bot direct handling (highest priority)
-2. Strategy 2: UserBot reads, then forward/copy
-3. Strategy 3: UserBot downloads, Bot re-uploads
-4. Strategy 4: fail marker `#fail2forward`
+> **Note:** "Strategy 1 succeeded" in logs means the first-tier attempt succeeded — in `copy` mode this may internally use `send_message` / `send_file`. Comment links (`?comment=`) point to the linked discussion group, which may be private even if the original post is public.
 
-Operational priority interpretation:
-
-- Priority A (best chance to stay on Strategy 1):
-  Bot can send in target group/channel and is admin (private or public target).
-- Priority B (often still Strategy 1):
-  Source is a public channel/group, so Bot can usually read directly.
-- Priority C (often downgraded to Strategy 3):
-  Source is a private discussion group (comment area), or source has protected/no-forward content enabled.
-
-Notes:
-
-- `Strategy 1 success` in logs means the first layer succeeded, not necessarily native `forward`.
-- In `copy` mode, Strategy 1 may internally use `send_message/send_file`.
-- `?comment=` links point to messages in linked discussion groups, not in the channel post itself.
-
-### 8. Additional Notes
-
-- `forward` keeps native forwarding semantics; `copy` is often more compatible but may hit send-side limits faster.
-- For private sources, UserBot must be a member and able to read.
-- Topic delivery depends on target-side topic permissions (`target_topic_id`).
-- Hard-block filtering uses a union rule for cross-platform blocking:
-  if chat-level or message-level `restriction_reason.platform=all` is present, it is treated as blocked.
-  Restrictions limited to specific platforms are not treated as hard-blocks and will still be forwarded.
-- Albums are sent as a group first; on failure, it downgrades to per-message forwarding.
-- If you see frequent `FloodWait`, tune `rate_limit` parameters.
-
-### 9. Docker
+## Docker Deployment
 
 ```bash
 docker compose up -d --build
@@ -109,19 +82,28 @@ docker compose up -d --build
 
 Volume mounts:
 
-- `./config.yaml` -> `/app/config.yaml`
-- `./data` -> `/app/data`
-- `./sessions` -> `/app/sessions`
+| Host | Container |
+|------|-----------|
+| `./config.yaml` | `/app/config.yaml` |
+| `./data` | `/app/data` |
+| `./sessions` | `/app/sessions` |
 
-### 10. Logs and Troubleshooting
+## Important Notes
 
-Main loggers:
+- `forward` mode preserves native forwarding semantics; `copy` mode is more compatible but may trigger rate limits faster
+- For private sources, UserBot must be a member with read access — otherwise strategies 2 and 3 will both fail
+- Forum topic forwarding relies on `target_topic_id`; insufficient permissions on the target side will cause delivery failures
+- If you encounter frequent `FloodWait` errors, increase the `rate_limit` parameters in your config
+- Albums are sent as a group first; on failure, the bot falls back to per-message forwarding
 
-- `tg_forward_bot.handlers`
-- `tg_forward_bot.link_parser`
-- `tg_forward_bot.forwarder`
-- `tg_forward_bot.syncer`
-- `tg_forward_bot.monitor`
+## Logging & Troubleshooting
 
-See `docs/operations.md` and `docs/architecture.md` for deeper operational details.
+| Logger | Purpose |
+|--------|---------|
+| `tg_forward_bot.handlers` | Command and private-chat parsing entry point |
+| `tg_forward_bot.link_parser` | Link resolution and discussion group discovery |
+| `tg_forward_bot.forwarder` | Strategy execution and fallback |
+| `tg_forward_bot.syncer` | Historical sync progress |
+| `tg_forward_bot.monitor` | Real-time monitoring events |
 
+For detailed operational guidance, see [`docs/operations.md`](docs/operations.md) and [`docs/architecture.md`](docs/architecture.md).

@@ -1,142 +1,80 @@
-# TG-Sync-AutoForward-SaveRestricted-Bot
+# TG Forward Bot
 
-[English README](./README.md)
+[English](./README.md)
 
-基于 Telethon 的 Telegram 消息搬运工具，采用 `Bot + UserBot` 双客户端架构，支持私聊链接解析、历史同步、实时监控和多级策略降级转发。
+基于 Telethon 的 Telegram 消息转发工具，采用 **Bot + UserBot** 双客户端架构，支持私聊链接解析、历史消息同步、实时监控转发和多级策略自动降级。
 
-### 1. 功能概览
+## 功能特性
 
-- 私聊贴链接解析：公开/私有/评论区/话题链接
-- `/sync`：历史消息同步（支持频道、群组、群组话题）
-- `/monitor`：实时消息监控转发（支持频道、群组、群组话题）
-- 同步/转发内置“硬封禁”自动过滤：
-  仅过滤全平台受限（`platform=all`，典型表现为 `can't be displayed`）的频道/群组或消息；
-  仅限部分平台（如 iOS/Android）的限制不会被过滤，仍会保留转发
-- 统一降级策略：优先低成本，失败自动兜底
-- 支持 `copy`（默认）与 `forward` 模式
-- 支持 `?comment=<id>` 与 `?single`
-- 全部策略失败后发送 `#fail2forward`
+- **链接解析** — 私聊发送 `t.me/...` 链接即可触发，支持公开/私有频道、群组、评论区、话题
+- **历史同步** — `/sync` 拉取历史消息，支持断点续传
+- **实时监控** — `/monitor` 监听新消息并自动转发
+- **多级降级** — Bot 直发 → UserBot 辅助 → 下载重传 → 失败标记 `#fail2forward`
+- **相册感知** — 优先整组发送，失败后逐条降级
+- **硬封禁过滤** — 自动跳过全平台受限（`platform=all`）的内容；仅限部分平台的限制不受影响
+- **双模式** — 支持 `copy`（默认）和 `forward` 两种转发模式
 
-### 2. 架构与职责
+## 架构
 
-- `Bot`：命令交互、目标发送（写）
-- `UserBot`：受限来源读取、下载媒体（读）
-- 设计原则：`UserBot 读，Bot 写`，仅在需要时让 UserBot 参与写入
+| 角色 | 职责 |
+|------|------|
+| **Bot** | 命令交互、目标发送（写） |
+| **UserBot** | 受限来源读取、媒体下载（读） |
 
-### 3. 项目结构
+设计原则：**UserBot 读，Bot 写**，仅在必要时让 UserBot 参与写入。
 
-```text
-TG-Sync-AutoForward-SaveRestricted-Bot/
-├── main.py
-├── config.example.yaml
-├── bot/
-│   ├── handlers.py
-│   ├── link_parser.py
-│   └── telegram_utils.py
-├── core/
-│   ├── forwarder.py
-│   ├── message_logic.py
-│   ├── monitor.py
-│   ├── rate_limiter.py
-│   └── syncer.py
-├── db/
-│   ├── database.py
-│   └── models.py
-└── docs/
-    ├── architecture.md
-    └── operations.md
-```
-
-### 4. 环境要求
+## 环境要求
 
 - Python 3.11+
-- Telegram `api_id` / `api_hash`
-- Bot Token
-- 一个 UserBot 账号（手机号登录）
+- Telegram `api_id` / `api_hash`（[my.telegram.org](https://my.telegram.org)）
+- Bot Token（[@BotFather](https://t.me/BotFather)）
+- UserBot 账号（手机号登录）
 
-### 5. 快速启动
-
-1. 安装依赖
+## 快速开始
 
 ```bash
 pip install -r requirements.txt
-```
-
-2. 复制并编辑配置
-
-```bash
-cp config.example.yaml config.yaml
-```
-
-3. 启动
-
-```bash
+cp config.example.yaml config.yaml   # 编辑填入你的配置
 python main.py
 ```
 
-首次启动会要求 UserBot 验证码登录，成功后会在 `sessions/` 目录保存会话。
+> 首次启动需要 UserBot 验证码登录，会话文件保存在 `sessions/` 目录。
 
-### 6. 命令说明
+## 命令
 
-- `/start`：启动说明
-- `/help`：帮助
-- `/sync <链接> [--forward]`：同步历史消息到当前群/频道（支持频道、群组、群组话题）
-- `/monitor <链接> [--forward]`：监控新消息并转发到当前群/频道（支持频道、群组、群组话题；要求 UserBot 已加入源）
-- `/list`：任务管理（暂停/恢复/删除/清空）
-- `/settings`：查看限流配置
+| 命令 | 说明 |
+|------|------|
+| `/sync <链接> [--forward]` | 同步历史消息到当前会话（频道/群组/话题） |
+| `/monitor <链接> [--forward]` | 监控新消息并转发到当前会话（需 UserBot 已加入源） |
+| `/list` | 任务管理：暂停 / 恢复 / 删除 / 清空 |
+| `/settings` | 查看限流配置 |
+| `/start` · `/help` | 启动说明与帮助 |
 
-私聊直接发送 `t.me/...` 链接会触发解析与转发。
+私聊直接发送 `t.me/...` 链接即可触发解析与转发。
 
-### 7. 源类型权限矩阵
+## 来源访问要求
 
-|源类型|Bot 要求/作用|UserBot 要求（/sync）|UserBot 要求（/monitor）|
-|--|--|--|--|
-|公开频道|Bot 负责目标发送；源侧可尝试直读|通常不要求加入（可访问即可）|**必须加入**|
-|私密频道|Bot 源侧基本不可读|必须已加入且可读|**必须已加入且可读**|
-|公开群组|Bot 负责目标发送；源侧可尝试直读|通常不要求加入（可访问即可）|**必须加入**|
-|私密群组|Bot 源侧基本不可读|必须已加入且可读|**必须已加入且可读**|
-|群组话题（Forum Topic）|Bot 负责目标发送到目标话题|需能读该群；再按 `source_topic_id` 抓历史|**必须加入**|
+| 来源类型 | `/sync` 对 UserBot 的要求 | `/monitor` 对 UserBot 的要求 |
+|----------|--------------------------|------------------------------|
+| 公开频道 / 群组 | 通常无需加入 | **必须加入** |
+| 私密频道 / 群组 | 必须已加入且可读 | **必须已加入且可读** |
+| 群组话题（Forum） | 需能读取该群 | **必须加入** |
 
-说明：
+- `/monitor` 创建任务前会校验 UserBot 是否已加入并可访问源，不满足会拒绝创建。
+- Bot 始终负责目标侧发送；来源侧读取能力取决于来源是否公开。
 
-- `/monitor` 生效前会校验 UserBot 是否已加入并可访问源；不满足会直接提示并拒绝创建任务。
-- `/sync` 对公开源通常不要求 UserBot 先加入，但对私有源/受限源仍要求 UserBot 可访问。
+## 转发策略
 
-### 8. 转发策略（重点）
+运行时固定按以下顺序尝试，失败自动降级：
 
-程序执行时固定按 1 -> 2 -> 3 -> 4 尝试：
+1. **Bot 直接处理** — 成本最低，Bot 可读源时优先命中
+2. **UserBot 读取 + Bot 处理** — 源受限时由 UserBot 辅助读取
+3. **UserBot 下载 + Bot 重新上传** — 源禁止转发或内容受保护时的兜底
+4. **失败标记** — 全部失败后发送 `#fail2forward`
 
-1. 策略1：`Bot` 直接处理（最优先）
-2. 策略2：`UserBot` 读取后处理
-3. 策略3：`UserBot` 下载后由 `Bot` 重新上传
-4. 策略4：发送失败标记 `#fail2forward`
+> **提示**：日志中的"策略1成功"表示第一层尝试成功，`copy` 模式下可能实际使用的是 `send_message` / `send_file`。评论链接 `?comment=` 的消息位于 discussion 群，主贴公开不代表评论区也公开。
 
-结合部署与来源类型，建议按以下优先级理解：
-
-- 优先级A（策略1命中率最高）：
-  Bot 在目标群组/频道可正常发消息，且为管理员（无论私密或公开目标）。
-- 优先级B（通常仍可优先策略1）：
-  来源为公开频道/公开群组时，Bot 往往可直接读取来源并处理。
-- 优先级C（常降到策略3）：
-  来源是私密评论区 discussion 群，或源聊天开启了“禁止转发/保护内容（Protected Content）”。
-
-说明：
-
-- 日志里的“策略1成功”表示第一层尝试成功，不等价于一定使用原生 `forward`；
-  在 `copy` 模式下可能是 `send_message/send_file`。
-- 评论链接 `?comment=` 实际消息位于 discussion 群，主贴公开不代表评论区也公开。
-
-### 9. 其他注意点
-
-- `forward` 模式更接近原始转发；`copy` 模式更稳定但更容易触发发送限流。
-- 私有来源必须确保 UserBot 已加入并可读，否则策略2/3都会失败。
-- Topic/论坛群转发依赖 `target_topic_id`，目标侧权限不足会导致发送失败。
-- 硬封禁采用并集判定：只要 chat 级或 message 级出现 `restriction_reason.platform=all`，即视为已封禁并过滤。
-  仅在部分平台生效的限制不视为硬封禁，仍正常转发。
-- 相册会优先整组发送，失败后才降级为逐条转发。
-- 出现大量 `FloodWait` 时，建议调大 `rate_limit` 相关参数。
-
-### 10. Docker 运行
+## Docker 部署
 
 ```bash
 docker compose up -d --build
@@ -144,18 +82,28 @@ docker compose up -d --build
 
 挂载目录：
 
-- `./config.yaml` -> `/app/config.yaml`
-- `./data` -> `/app/data`
-- `./sessions` -> `/app/sessions`
+| 宿主机 | 容器 |
+|--------|------|
+| `./config.yaml` | `/app/config.yaml` |
+| `./data` | `/app/data` |
+| `./sessions` | `/app/sessions` |
 
-### 11. 日志与排障
+## 注意事项
 
-关键 logger：
+- `forward` 模式保留原始转发语义；`copy` 模式兼容性更好但更容易触发限流
+- 私有来源必须确保 UserBot 已加入并可读，否则策略 2/3 均会失败
+- 话题转发依赖 `target_topic_id`，目标侧权限不足会导致发送失败
+- 频繁出现 `FloodWait` 时，建议调大 `rate_limit` 相关参数
+- 相册优先整组发送，失败后降级为逐条转发
 
-- `tg_forward_bot.handlers`：命令与私聊解析入口
-- `tg_forward_bot.link_parser`：链接解析与 discussion 解析
-- `tg_forward_bot.forwarder`：策略执行与降级
-- `tg_forward_bot.syncer`：历史同步进度
-- `tg_forward_bot.monitor`：实时监控事件
+## 日志与排障
 
-更多细节见 `docs/operations.md` 与 `docs/architecture.md`。
+| Logger | 用途 |
+|--------|------|
+| `tg_forward_bot.handlers` | 命令与私聊解析入口 |
+| `tg_forward_bot.link_parser` | 链接解析与 discussion 解析 |
+| `tg_forward_bot.forwarder` | 策略执行与降级 |
+| `tg_forward_bot.syncer` | 历史同步进度 |
+| `tg_forward_bot.monitor` | 实时监控事件 |
+
+详细运维文档见 [`docs/operations.md`](docs/operations.md) 与 [`docs/architecture.md`](docs/architecture.md)。
