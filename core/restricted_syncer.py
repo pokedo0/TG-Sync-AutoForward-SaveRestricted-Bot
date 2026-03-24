@@ -1,8 +1,8 @@
 """受限消息同步：通过 Takeout Session 重新拉取被平台封禁的消息并转发。
 
 与 Syncer 的区别：
-- Syncer: 同步全量历史，跳过受限消息
-- RestrictedSyncer: 仅补发那些被 Syncer 跳过的受限消息，利用 Takeout 绕过限制
+- Syncer: 同步全量历史，受限消息通过 Takeout 内联转发
+- RestrictedSyncer: 仅补发受限消息，利用 Takeout 绕过限制
 """
 import asyncio
 import logging
@@ -11,28 +11,23 @@ from collections.abc import Awaitable, Callable
 from telethon import TelegramClient, errors
 from telethon.tl.types import Message, MessageService
 
+from core.base_component import SyncComponentBase
 from core.message_logic import (
     build_forward_units,
     detect_hard_restriction,
     is_chat_globally_restricted,
     is_file_media,
 )
-from core.rate_limiter import RateLimiter
 from db.database import Database
 from db import models
 
 logger = logging.getLogger("tg_forward_bot.restricted_syncer")
 
 
-class RestrictedSyncer:
+class RestrictedSyncer(SyncComponentBase):
     def __init__(self, bot: TelegramClient, userbot: TelegramClient,
                  db: Database, config: dict):
-        self.bot = bot
-        self.userbot = userbot
-        self.db = db
-        self.config = config
-        self.rl = RateLimiter(config)
-        self._cancel_flags: dict[int, bool] = {}
+        super().__init__(bot, userbot, db, config)
 
     # ------------------------------------------------------------------
     # Takeout 转发核心
@@ -107,7 +102,6 @@ class RestrictedSyncer:
         """
         restricted_ids: list[int] = []
         total_scanned = 0
-        iter_reply_to = None if source_topic_id == 1 else source_topic_id
         chat_globally_restricted = False
 
         try:
@@ -120,44 +114,27 @@ class RestrictedSyncer:
             async for msg in self.userbot.iter_messages(
                 source_chat_id,
                 reverse=True,
-                reply_to=iter_reply_to,
+                reply_to=source_topic_id,
             ):
                 if self._cancel_flags.get(task_id):
                     break
                 if isinstance(msg, MessageService):
                     continue
-                if source_topic_id == 1 and not self._is_general_topic_msg(msg):
-                    continue
                 total_scanned += 1
                 restricted, _ = detect_hard_restriction(chat_globally_restricted, msg)
                 if restricted:
                     restricted_ids.append(msg.id)
-        except (errors.ChannelPrivateError, errors.ChatAdminRequiredError) as e:
-            logger.error("受限同步任务 #%s 源不可访问: %s", task_id, type(e).__name__)
-            await notify(f"❌ 受限同步 #{task_id} 失败: 源不可访问")
-            return None, total_scanned
         except errors.FloodWaitError as e:
             logger.warning("受限同步任务 #%s 扫描时 FloodWait %ds", task_id, e.seconds)
             await asyncio.sleep(e.seconds)
             return [], total_scanned
         except Exception as e:
+            if await self._handle_collect_error(task_id, e, notify):
+                return None, total_scanned
             logger.error("受限同步任务 #%s 扫描异常: %s", task_id, e)
             await notify(f"❌ 受限同步 #{task_id} 扫描失败: {e}")
             return None, total_scanned
         return restricted_ids, total_scanned
-
-    @staticmethod
-    def _is_general_topic_msg(msg) -> bool:
-        """判断消息是否属于 General 话题。复用 Syncer 同款逻辑。"""
-        reply_to = getattr(msg, "reply_to", None)
-        if not reply_to:
-            return True
-        top_id = getattr(reply_to, "reply_to_top_id", None)
-        if top_id:
-            return top_id == 1
-        if getattr(reply_to, "forum_topic", False):
-            return getattr(reply_to, "reply_to_msg_id", None) in (1, None)
-        return True
 
     # ------------------------------------------------------------------
     # Takeout 阶段：用 Takeout 重新拉取并转发
@@ -174,11 +151,7 @@ class RestrictedSyncer:
         notify: Callable[[str], Awaitable[None]],
     ) -> tuple[int, int]:
         """使用 Takeout 拉取一批受限消息 ID 并转发。返回 (成功数, 失败数)。"""
-        real_chat_id = (
-            source_chat_id
-            if str(source_chat_id).startswith("-100")
-            else int(f"-100{source_chat_id}")
-        )
+        real_chat_id = self._ensure_supergroup_id(source_chat_id)
 
         try:
             messages = await takeout.get_messages(real_chat_id, ids=msg_ids)
@@ -190,7 +163,6 @@ class RestrictedSyncer:
         if not valid_msgs:
             return 0, len(msg_ids)
 
-        # 按 grouped_id 分组
         units = build_forward_units(valid_msgs)
         success_count = 0
         fail_count = 0
@@ -199,6 +171,7 @@ class RestrictedSyncer:
             if self._cancel_flags.get(task_id):
                 break
             await self.rl.wait()
+            target_ids = []
             try:
                 if kind == "album":
                     album_msgs = [m for m in valid_msgs if m.id in source_ids]
@@ -215,6 +188,9 @@ class RestrictedSyncer:
                     msg = next((m for m in valid_msgs if m.id == src_id), None)
                     if not msg:
                         fail_count += 1
+                        self._log_forward_result(
+                            logger, "restricted_sync", task_id, kind, source_ids, [], restricted=True
+                        )
                         continue
                     tgt_id = await self._copy_single(
                         takeout, msg, target_chat_id, target_topic_id
@@ -222,6 +198,7 @@ class RestrictedSyncer:
                     if tgt_id:
                         await models.save_message_map(self.db, task_id, src_id, tgt_id)
                         success_count += 1
+                        target_ids = [tgt_id]
                     else:
                         fail_count += 1
             except errors.FloodWaitError as e:
@@ -231,6 +208,10 @@ class RestrictedSyncer:
             except Exception as e:
                 logger.warning("受限同步 #%s 转发异常 ids=%s: %s", task_id, source_ids, e)
                 fail_count += len(source_ids)
+
+            self._log_forward_result(
+                logger, "restricted_sync", task_id, kind, source_ids, target_ids, restricted=True
+            )
 
         return success_count, fail_count
 
@@ -253,13 +234,7 @@ class RestrictedSyncer:
         self._cancel_flags[task_id] = False
 
         async def _notify(text: str) -> None:
-            if not notify_chat_id:
-                return
-            reply_to = notify_reply_to_msg_id or notify_topic_id
-            await self.bot.send_message(
-                notify_chat_id, text,
-                reply_to=reply_to if reply_to else None,
-            )
+            await self._notify(notify_chat_id, notify_topic_id, notify_reply_to_msg_id, text)
 
         logger.info(
             "受限同步任务 #%s 开始: source=%s topic=%s",
@@ -342,6 +317,3 @@ class RestrictedSyncer:
             f"• Takeout 成功转发: {total_success} 条\n"
             f"• 失败/无媒体: {total_fail} 条"
         )
-
-    def cancel(self, task_id: int):
-        self._cancel_flags[task_id] = True
