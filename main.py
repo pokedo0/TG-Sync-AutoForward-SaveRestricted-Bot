@@ -59,7 +59,7 @@ async def main():
             BotCommand(command="start", description="开始使用"),
             BotCommand(command="help", description="使用说明"),
             BotCommand(command="sync", description="同步历史消息到当前群"),
-            BotCommand(command="syncrestrictedmsg", description="通过 Takeout 补发受限消息"),
+            BotCommand(command="syncrestrictedmsg", description="通过 Takeout导出数据接口 补发受限消息"),
             BotCommand(command="monitor", description="监控新消息（需UserBot先加入源）"),
             BotCommand(command="list", description="管理所有任务"),
             BotCommand(command="settings", description="查看限流配置"),

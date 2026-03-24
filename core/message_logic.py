@@ -106,10 +106,29 @@ def has_platform_all_reason(reasons) -> bool:
     return False
 
 
+def is_chat_globally_restricted(entity) -> bool:
+    """判断 chat 实体是否为全平台封禁（restricted 且 reason.platform=all）。"""
+    if not entity or not getattr(entity, "restricted", False):
+        return False
+    reasons = getattr(entity, "restriction_reason", None) or []
+    return has_platform_all_reason(reasons)
+
+
+def detect_hard_restriction(
+        chat_globally_restricted: bool,
+        msg: Message | None = None,
+) -> tuple[bool, str]:
+    """统一硬封禁判定：优先 chat 级，其次 message 级。"""
+    if chat_globally_restricted:
+        return True, "chat.restricted+reason.platform_all"
+    if is_restricted_message(msg):
+        return True, "message.reason.platform_all"
+    return False, ""
+
+
 def is_restricted_message(msg: Message | None) -> bool:
     """判断单条消息是否为全平台受限消息（restriction_reason.platform=all）。"""
     if not msg:
         return False
     reasons = getattr(msg, "restriction_reason", None) or []
     return has_platform_all_reason(reasons)
-

@@ -421,7 +421,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             "功能:\n"
             "• 私聊发链接 → 解析受限内容\n"
             "• /sync <链接> → 同步历史消息到当前群\n"
-            "• /syncrestrictedmsg <链接> → 通过 Takeout 补发受限消息\n"
+            "• /syncrestrictedmsg <链接> → 通过 Takeout导出数据接口 补发受限消息\n"
             "• /monitor <链接> → 监控新消息转发到当前群（需 UserBot 先加入源）\n"
             "• /list → 管理所有任务\n"
             "• /settings → 查看配置")
@@ -431,7 +431,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         await event.reply(
             "📖 使用说明:\n\n"
             "/sync <链接> [--forward] — 同步源历史到当前群\n"
-            "/syncrestrictedmsg <链接> — 通过 Takeout 补发受限消息到当前群\n"
+            "/syncrestrictedmsg <链接> — 通过 Takeout导出数据接口 补发受限消息到当前群\n"
             "/monitor <链接> [--forward] — 监控源新消息到当前群（要求 UserBot 已加入源）\n"
             "/list — 管理所有任务（含暂停/恢复/删除）\n"
             "/settings — 查看限流配置\n\n"

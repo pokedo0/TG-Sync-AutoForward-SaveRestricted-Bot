@@ -7,7 +7,11 @@ from telethon import TelegramClient, errors
 from telethon.tl.types import MessageService
 
 from core.base_component import ForwardingComponent
-from core.message_logic import build_forward_units
+from core.message_logic import (
+    build_forward_units,
+    detect_hard_restriction,
+    is_chat_globally_restricted,
+)
 from db.database import Database
 from db import models
 
@@ -130,6 +134,35 @@ class Syncer(ForwardingComponent):
             return 1, source_msg_id, True
         return 0, source_msg_id, False
 
+    async def _precheck_restricted_units(
+        self,
+        source_chat_id: int,
+        all_msgs: list,
+        units: list[tuple[str, list[int]]],
+    ) -> tuple[dict[int, tuple[bool, str]], int]:
+        """预检查每个转发单元是否受限（仅基于已拉取消息），返回缓存与受限消息总数。"""
+        chat_globally_restricted = False
+        try:
+            entity = await self.userbot.get_entity(source_chat_id)
+            chat_globally_restricted = is_chat_globally_restricted(entity)
+        except Exception:
+            chat_globally_restricted = False
+
+        msg_map = {m.id: m for m in all_msgs if m}
+        restriction_cache: dict[int, tuple[bool, str]] = {}
+        restricted_total = 0
+        for _, source_ids in units:
+            if not source_ids:
+                continue
+            anchor_id = source_ids[0]
+            restricted, restricted_field = detect_hard_restriction(
+                chat_globally_restricted, msg_map.get(anchor_id)
+            )
+            restriction_cache[anchor_id] = (restricted, restricted_field)
+            if restricted:
+                restricted_total += len(source_ids)
+        return restriction_cache, restricted_total
+
     async def start_sync(self, task_id: int, source_chat_id: int,
                          target_chat_id: int, mode: str = "copy",
                          source_topic_id: int | None = None,
@@ -174,9 +207,15 @@ class Syncer(ForwardingComponent):
 
         total = len(all_msgs)
         logger.info("同步任务 #%s 共获取 %d 条消息", task_id, total)
-        await _notify(f"📋 开始同步，共 {total} 条消息")
-
         units = build_forward_units(all_msgs)
+        restriction_cache, restricted_messages = await self._precheck_restricted_units(
+            source_chat_id, all_msgs, units
+        )
+        await _notify(
+            f"📋 开始同步，共 {total} 条消息"
+            f"\n• 受限消息: {restricted_messages} 条"
+            f"\n• 待同步: {max(total - restricted_messages, 0)} 条"
+        )
 
         for kind, source_ids in units:
             if self._cancel_flags.get(task_id):
@@ -184,11 +223,10 @@ class Syncer(ForwardingComponent):
                 await _notify(f"⏸ 同步已暂停，已完成 {total_forwarded}/{total}")
                 return
 
-            restricted, restricted_field = await self.forwarder.detect_restriction(
-                source_chat_id, source_ids[0]
+            restricted, restricted_field = restriction_cache.get(
+                source_ids[0], (False, "")
             )
             if restricted:
-                restricted_messages += len(source_ids)
                 last_msg_id = source_ids[-1]
                 await models.update_last_synced(self.db, task_id, last_msg_id)
                 logger.info(

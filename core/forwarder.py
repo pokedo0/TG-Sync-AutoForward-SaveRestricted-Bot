@@ -6,7 +6,12 @@ import tempfile
 from telethon import TelegramClient, errors
 from telethon.tl.types import Message
 
-from core.message_logic import is_file_media, normalize_messages, has_platform_all_reason
+from core.message_logic import (
+    detect_hard_restriction,
+    is_chat_globally_restricted,
+    is_file_media,
+    normalize_messages,
+)
 from core.media_transfer import MediaTransferHelper
 from core.rate_limiter import RateLimiter
 
@@ -63,24 +68,23 @@ class Forwarder:
         msg_id: int | None = None,
     ) -> tuple[bool, str]:
         """硬封禁并集：message.restriction_reason.platform=all 或 chat级全平台封禁。"""
+        chat_globally_restricted = False
         try:
             entity = await self.userbot.get_entity(source_chat_id)
-            if getattr(entity, "restricted", False):
-                chat_reasons = getattr(entity, "restriction_reason", None) or []
-                if self._has_platform_all_reason(chat_reasons):
-                    return True, "chat.restricted+reason.platform_all"
+            chat_globally_restricted = is_chat_globally_restricted(entity)
         except Exception:
-            pass
+            chat_globally_restricted = False
+
+        restricted, field = detect_hard_restriction(chat_globally_restricted, None)
+        if restricted:
+            return restricted, field
 
         if msg_id is None:
             return False, ""
 
         try:
             msg = await self._get_single_message(self.userbot, source_chat_id, msg_id)
-            if msg:
-                msg_reasons = getattr(msg, "restriction_reason", None) or []
-                if self._has_platform_all_reason(msg_reasons):
-                    return True, "message.reason.platform_all"
+            return detect_hard_restriction(chat_globally_restricted, msg)
         except Exception:
             pass
 
@@ -488,6 +492,3 @@ class Forwarder:
                 pass
         return source_chat_id
 
-    @staticmethod
-    def _has_platform_all_reason(reasons) -> bool:
-        return has_platform_all_reason(reasons)

@@ -12,7 +12,10 @@ from telethon import TelegramClient, errors
 from telethon.tl.types import Message, MessageService
 
 from core.message_logic import (
-    build_forward_units, is_file_media, is_restricted_message,
+    build_forward_units,
+    detect_hard_restriction,
+    is_chat_globally_restricted,
+    is_file_media,
 )
 from core.rate_limiter import RateLimiter
 from db.database import Database
@@ -105,8 +108,15 @@ class RestrictedSyncer:
         restricted_ids: list[int] = []
         total_scanned = 0
         iter_reply_to = None if source_topic_id == 1 else source_topic_id
+        chat_globally_restricted = False
 
         try:
+            try:
+                entity = await self.userbot.get_entity(source_chat_id)
+                chat_globally_restricted = is_chat_globally_restricted(entity)
+            except Exception:
+                chat_globally_restricted = False
+
             async for msg in self.userbot.iter_messages(
                 source_chat_id,
                 reverse=True,
@@ -119,7 +129,8 @@ class RestrictedSyncer:
                 if source_topic_id == 1 and not self._is_general_topic_msg(msg):
                     continue
                 total_scanned += 1
-                if is_restricted_message(msg):
+                restricted, _ = detect_hard_restriction(chat_globally_restricted, msg)
+                if restricted:
                     restricted_ids.append(msg.id)
         except (errors.ChannelPrivateError, errors.ChatAdminRequiredError) as e:
             logger.error("受限同步任务 #%s 源不可访问: %s", task_id, type(e).__name__)
