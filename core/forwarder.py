@@ -6,7 +6,7 @@ import tempfile
 from telethon import TelegramClient, errors
 from telethon.tl.types import Message
 
-from core.message_logic import is_file_media, normalize_messages
+from core.message_logic import is_file_media, normalize_messages, has_platform_all_reason
 from core.media_transfer import MediaTransferHelper
 from core.rate_limiter import RateLimiter
 
@@ -490,12 +490,4 @@ class Forwarder:
 
     @staticmethod
     def _has_platform_all_reason(reasons) -> bool:
-        for reason in reasons or []:
-            platform = None
-            if isinstance(reason, dict):
-                platform = reason.get("platform")
-            else:
-                platform = getattr(reason, "platform", None)
-            if isinstance(platform, str) and platform.lower() == "all":
-                return True
-        return False
+        return has_platform_all_reason(reasons)

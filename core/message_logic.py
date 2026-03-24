@@ -88,3 +88,28 @@ async def collect_album_messages(client: TelegramClient, chat_id: int,
     ]
     return sorted(album_msgs, key=lambda m: m.id)
 
+
+def has_platform_all_reason(reasons) -> bool:
+    """判断 restriction_reason 列表中是否包含 platform='all' 的条目。
+
+    支持 Telethon 原生对象和 dict 两种格式。
+    供 Forwarder.detect_restriction / RestrictedSyncer 等共用。
+    """
+    for reason in reasons or []:
+        platform = None
+        if isinstance(reason, dict):
+            platform = reason.get("platform")
+        else:
+            platform = getattr(reason, "platform", None)
+        if isinstance(platform, str) and platform.lower() == "all":
+            return True
+    return False
+
+
+def is_restricted_message(msg: Message | None) -> bool:
+    """判断单条消息是否为全平台受限消息（restriction_reason.platform=all）。"""
+    if not msg:
+        return False
+    reasons = getattr(msg, "restriction_reason", None) or []
+    return has_platform_all_reason(reasons)
+

@@ -27,6 +27,7 @@ from core.message_logic import (
     collect_album_messages,
 )
 from core.syncer import Syncer
+from core.restricted_syncer import RestrictedSyncer
 from core.monitor import MonitorManager
 from core.rate_limiter import _get_dynamic_rate_limit
 from db.database import Database
@@ -40,6 +41,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
     admin_ids = set(config.get("admin_ids", []))
     allow_public = config.get("allow_public_resolve", False)
     syncer = Syncer(bot, userbot, db, config)
+    restricted_syncer = RestrictedSyncer(bot, userbot, db, config)
     forwarder = monitor_manager.forwarder
     _sync_tasks: dict[int, asyncio.Task] = {}
 
@@ -297,10 +299,11 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
                 )
 
     async def _stop_running_task(task: dict):
-        """停止一个运行中的任务（sync 或 monitor）。"""
+        """停止一个运行中的任务（sync / sync_restricted / monitor）。"""
         tid = task["id"]
-        if task["type"] == "sync":
+        if task["type"] in ("sync", "sync_restricted"):
             syncer.cancel(tid)
+            restricted_syncer.cancel(tid)
             at = _sync_tasks.pop(tid, None)
             if at:
                 at.cancel()
@@ -311,7 +314,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         """为任务列表构建单列 inline button。"""
         buttons = []
         for t in tasks:
-            emoji = "🔄" if t["type"] == "sync" else "👁"
+            emoji = "🔄" if t["type"] in ("sync", "sync_restricted") else "👁"
             status = STATUS_EMOJI.get(t["status"], "❓")
             src = await _format_chat_topic_display(
                 t["source_chat_id"], t["source_topic_id"], short=True
@@ -418,6 +421,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             "功能:\n"
             "• 私聊发链接 → 解析受限内容\n"
             "• /sync <链接> → 同步历史消息到当前群\n"
+            "• /syncrestrictedmsg <链接> → 通过 Takeout 补发受限消息\n"
             "• /monitor <链接> → 监控新消息转发到当前群（需 UserBot 先加入源）\n"
             "• /list → 管理所有任务\n"
             "• /settings → 查看配置")
@@ -427,6 +431,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         await event.reply(
             "📖 使用说明:\n\n"
             "/sync <链接> [--forward] — 同步源历史到当前群\n"
+            "/syncrestrictedmsg <链接> — 通过 Takeout 补发受限消息到当前群\n"
             "/monitor <链接> [--forward] — 监控源新消息到当前群（要求 UserBot 已加入源）\n"
             "/list — 管理所有任务（含暂停/恢复/删除）\n"
             "/settings — 查看限流配置\n\n"
@@ -477,6 +482,55 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             notify_chat_id=event.chat_id,
             notify_topic_id=target_topic_id,
             notify_reply_to_msg_id=start_msg.id))
+        _sync_tasks[task_id] = task
+
+    @bot.on(events.NewMessage(pattern=r"/syncrestrictedmsg(?:@\w+)?\s+"))
+    async def on_sync_restricted(event):
+        logger.info("收到 /syncRestrictedMsg 命令 from user=%s chat=%s", event.sender_id, event.chat_id)
+        if not await _require_admin(event):
+            return
+
+        result = await _parse_source(event)
+        if not result:
+            return
+        parsed = result.parsed
+        source_id = result.source_id
+
+        target_chat_id = event.chat_id
+        target_topic_id = get_target_topic_id(event)
+
+        logger.info(
+            "创建受限同步任务: source=%s topic=%s -> target=%s target_topic=%s",
+            source_id, parsed.topic_id, target_chat_id, target_topic_id,
+        )
+        task_id = await models.create_task(
+            db, "sync_restricted", source_id, target_chat_id, "copy",
+            source_topic_id=parsed.topic_id,
+            target_topic_id=target_topic_id,
+        )
+
+        rl = _get_dynamic_rate_limit(config)
+        interval = rl.get("forward_interval", [2, 5])
+        source_desc = await _format_chat_topic_display(source_id, parsed.topic_id)
+        target_desc = await _format_chat_topic_display(
+            target_chat_id, target_topic_id, prefer_bot=True
+        )
+        start_msg = await event.reply(
+            f"🔓 受限消息同步任务 #{task_id} 已创建\n"
+            f"📌 源: {source_desc}\n"
+            f"🎯 目标: {target_desc}\n"
+            f"⏱ 转发间隔: {interval[0]}-{interval[1]}秒/条\n"
+            f"📋 模式: Takeout + Copy（仅同步受限消息）"
+        )
+
+        task = asyncio.create_task(restricted_syncer.start_sync(
+            task_id, source_id, target_chat_id,
+            source_topic_id=parsed.topic_id,
+            target_topic_id=target_topic_id,
+            notify_chat_id=event.chat_id,
+            notify_topic_id=target_topic_id,
+            notify_reply_to_msg_id=start_msg.id,
+        ))
         _sync_tasks[task_id] = task
 
     @bot.on(events.NewMessage(pattern=r"/monitor(?:@\w+)?\s+"))
@@ -545,7 +599,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             await event.answer("任务不存在", alert=True)
             return
 
-        emoji = "🔄" if t["type"] == "sync" else "👁"
+        emoji = "🔄" if t["type"] in ("sync", "sync_restricted") else "👁"
         status = STATUS_EMOJI.get(t["status"], "❓")
 
         # 解析源/目标完整信息（频道/群组 + 话题）。
@@ -574,8 +628,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         if t["status"] == "running":
             action_row.append(Button.inline("⏸ 暂停", data=f"pause:{task_id}"))
         elif t["status"] in ("paused", "failed"):
-            if t["type"] == "monitor":
-                action_row.append(Button.inline("▶️ 恢复", data=f"resume:{task_id}"))
+            action_row.append(Button.inline("▶️ 恢复", data=f"resume:{task_id}"))
         action_row.append(Button.inline("🗑 删除", data=f"delete:{task_id}"))
         buttons.append(action_row)
 
@@ -615,27 +668,58 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         t = await _get_task_or_alert(event, task_id)
         if not t:
             return
-        if t["type"] != "monitor":
-            await event.answer("仅支持恢复监控任务", alert=True)
-            return
 
-        ok, reason = await _ensure_userbot_joined_source_for_monitor(
-            t["source_chat_id"], t["source_topic_id"]
-        )
-        if not ok:
-            alert_text = truncate(reason.replace("\n", " "), 80) if reason else "UserBot 未加入源，无法恢复"
-            await event.answer(alert_text, alert=True)
+        if t["type"] == "monitor":
+            ok, reason = await _ensure_userbot_joined_source_for_monitor(
+                t["source_chat_id"], t["source_topic_id"]
+            )
+            if not ok:
+                alert_text = truncate(reason.replace("\n", " "), 80) if reason else "UserBot 未加入源，无法恢复"
+                await event.answer(alert_text, alert=True)
+                await _show_task_detail(event, task_id)
+                return
+
+            await models.update_task_status(db, task_id, "running")
+            await monitor_manager.start_monitor(
+                task_id, t["source_chat_id"], t["target_chat_id"],
+                t["mode"], t["source_topic_id"], t["target_topic_id"])
+
+            logger.info("监控任务 #%s 已恢复", task_id)
+            await event.answer(f"▶️ 监控任务 #{task_id} 已恢复")
             await _show_task_detail(event, task_id)
-            return
 
-        await models.update_task_status(db, task_id, "running")
-        await monitor_manager.start_monitor(
-            task_id, t["source_chat_id"], t["target_chat_id"],
-            t["mode"], t["source_topic_id"], t["target_topic_id"])
+        elif t["type"] == "sync_restricted":
+            await models.update_task_status(db, task_id, "running")
+            start_msg_id = event.message_id
+            task = asyncio.create_task(restricted_syncer.start_sync(
+                task_id, t["source_chat_id"], t["target_chat_id"],
+                source_topic_id=t["source_topic_id"],
+                target_topic_id=t["target_topic_id"],
+                notify_chat_id=t["target_chat_id"],
+                notify_topic_id=t["target_topic_id"],
+            ))
+            _sync_tasks[task_id] = task
+            logger.info("受限同步任务 #%s 已恢复", task_id)
+            await event.answer(f"▶️ 受限同步任务 #{task_id} 已恢复")
+            await _show_task_detail(event, task_id)
 
-        logger.info("监控任务 #%s 已恢复", task_id)
-        await event.answer(f"▶️ 监控任务 #{task_id} 已恢复")
-        await _show_task_detail(event, task_id)
+        elif t["type"] == "sync":
+            await models.update_task_status(db, task_id, "running")
+            task = asyncio.create_task(syncer.start_sync(
+                task_id, t["source_chat_id"], t["target_chat_id"],
+                t["mode"],
+                source_topic_id=t["source_topic_id"],
+                target_topic_id=t["target_topic_id"],
+                notify_chat_id=t["target_chat_id"],
+                notify_topic_id=t["target_topic_id"],
+            ))
+            _sync_tasks[task_id] = task
+            logger.info("同步任务 #%s 已恢复", task_id)
+            await event.answer(f"▶️ 同步任务 #{task_id} 已恢复")
+            await _show_task_detail(event, task_id)
+
+        else:
+            await event.answer("未知任务类型，无法恢复", alert=True)
 
     @bot.on(events.CallbackQuery(pattern=rb"delete:(\d+)"))
     async def on_delete(event):

@@ -59,6 +59,7 @@ async def main():
             BotCommand(command="start", description="开始使用"),
             BotCommand(command="help", description="使用说明"),
             BotCommand(command="sync", description="同步历史消息到当前群"),
+            BotCommand(command="syncrestrictedmsg", description="通过 Takeout 补发受限消息"),
             BotCommand(command="monitor", description="监控新消息（需UserBot先加入源）"),
             BotCommand(command="list", description="管理所有任务"),
             BotCommand(command="settings", description="查看限流配置"),
@@ -71,7 +72,16 @@ async def main():
     register_handlers(bot, userbot, db, config, monitor_manager)
     logger.info("命令处理器已注册")
 
-    # 恢复之前运行中的 monitor 任务
+    # 恢复之前运行中的 monitor 任务；将孤立的 sync 任务自动暂停
+    from db import models as _models
+    _running = await _models.get_tasks_by_status(db, "running")
+    _paused_count = 0
+    for _t in _running:
+        if _t["type"] in ("sync", "sync_restricted"):
+            await _models.update_task_status(db, _t["id"], "paused")
+            _paused_count += 1
+    if _paused_count:
+        logger.info("已将 %d 个孤立的同步任务自动暂停（可通过 /list 恢复）", _paused_count)
     await monitor_manager.restore_tasks()
 
     logger.info("所有服务就绪，等待消息...")
