@@ -17,7 +17,7 @@
 | 受限消息处理方式 | Inline Takeout（遇到即转发，保持目标消息顺序） |
 | Takeout 会话生命周期 | 懒加载（首次遇到受限消息时开启，同步结束时关闭） |
 | 日志方案 | Syncer 层统一打印，格式参考 Forwarder 风格，抽取为基类方法 |
-| 代码复用 | RestrictedSyncer 继承 ForwardingComponent |
+| 代码复用 | RestrictedSyncer 继承 SyncComponentBase（轻量基类，不含 Forwarder） |
 
 ## 约束
 
@@ -27,29 +27,39 @@
 
 ## Section 1：基类重构 & 代码复用
 
-### ForwardingComponent 基类扩展（`core/base_component.py`）
+### 拆分基类层次
 
-新增成员：
+当前 `ForwardingComponent.__init__` 调用 `build_forward_runtime()` 创建 `Forwarder` + `RateLimiter`。
+RestrictedSyncer 不需要 `Forwarder`（它用 Takeout 静态方法直接转发），继承后会白白创建一个 `Forwarder`。
 
-- `_cancel_flags: dict[int, bool]`：任务取消标记（原 Syncer/RestrictedSyncer 各有一份）
+**方案**：拆分为两层基类：
+
+1. `SyncComponentBase`（新建，在 `core/base_component.py` 中）：轻量基类，只持有 `bot/userbot/db/config/rl`，不创建 `Forwarder`。包含共享方法。
+2. `ForwardingComponent` 继承 `SyncComponentBase`，额外创建 `self.forwarder`。
+
+### SyncComponentBase 新增成员
+
+- `_cancel_flags: dict[int, bool]`：任务取消标记
 - `cancel(task_id)`：设置取消标记
 - `_notify(notify_chat_id, notify_topic_id, notify_reply_to_msg_id, text)`：发送通知消息
 - `_is_general_topic_msg(msg)` 静态方法：判断消息是否属于 General 话题
 - `_log_forward_result(...)` 静态方法：统一日志格式
+- `_handle_collect_error(task_id, error, notify)` 方法：收集阶段错误处理（原 Syncer 独有，RestrictedSyncer 有类似逻辑可复用）
 
-### RestrictedSyncer 改为继承 ForwardingComponent
+### RestrictedSyncer 改为继承 SyncComponentBase
 
 - 删除 `__init__` 中手动持有的 `bot/userbot/db/config`
 - 删除 `self.rl = RateLimiter(config)`（基类已提供）
 - 删除重复的 `_is_general_topic_msg`
 - 删除 `_cancel_flags` 和 `cancel()`
-- 删除 `_notify` 闭包，改用基类 `self._notify()`
+- `start_sync` 中的 `_notify` 闭包保留为局部包装，内部调用 `self._notify()`（因为 `_collect_restricted_ids` 和 `_forward_restricted_batch` 接受 `Callable[[str], Awaitable[None]]` 回调，需要单参数包装）
 - 保留 `_copy_single`/`_copy_album`（Takeout 专用静态方法）
 - 保留 `_collect_restricted_ids`、`_forward_restricted_batch`、`start_sync`
 
 ### Syncer 简化
 
-- 删除自己的 `_is_general_topic_msg`、`_cancel_flags`、`cancel()`，改用基类
+- 改为继承 `ForwardingComponent`（不变，`ForwardingComponent` 现在继承 `SyncComponentBase`）
+- 删除自己的 `_is_general_topic_msg`、`_notify`、`_cancel_flags`、`cancel()`、`_handle_collect_error`，改用基类
 
 影响：纯重构，行为完全不变。
 
@@ -60,7 +70,14 @@
 - `start_sync` 新增 `takeout` 变量，初始 `None`
 - 遇到第一个受限单元时调用 `self.userbot.takeout()` 开启
 - 手动 `__aenter__`/`__aexit__` 管理（开启时机不确定，不用 `async with`）
-- 同步结束时在 `finally` 块中关闭
+- 同步结束时在 `finally` 块中关闭，用 `asyncio.shield()` 保护关闭操作防止被 task cancel 打断
+
+### `real_chat_id` 转换
+
+抽取为 `SyncComponentBase` 的静态方法 `_ensure_supergroup_id(chat_id)`：
+- 如果 `chat_id` 已经是 `-100` 前缀的负数，直接返回
+- 如果是正数，加 `-100` 前缀
+- 使用 `abs()` + 数值判断代替字符串拼接，避免普通群组 ID 的边界问题
 
 ### 新增 `_forward_restricted_unit` 方法
 
@@ -74,10 +91,10 @@ async def _forward_restricted_unit(
 
 流程：
 1. 用 takeout `get_messages(real_chat_id, ids=source_ids)` 拉取消息
-2. `real_chat_id` 转换逻辑复用 RestrictedSyncer 已有的（带 `-100` 前缀）
+2. `real_chat_id` 通过 `_ensure_supergroup_id()` 转换
 3. 调用 `RestrictedSyncer._copy_single` / `RestrictedSyncer._copy_album`（静态方法）
 4. 保存 `message_map`，更新 `last_synced_msg_id`
-5. 返回 `(msg_count, last_msg_id, success)` 与 `_forward_unit` 一致
+5. 返回 `(msg_count, last_msg_id, success)`：`msg_count` = 实际成功转发数，`last_msg_id` = `source_ids[-1]`，`success` = 至少一条成功
 
 ### start_sync 遍历逻辑变更
 
@@ -156,9 +173,9 @@ restricted_sync #2 msg=55 [受限:Takeout] 转发成功 -> target_msg=88
 
 | 文件 | 变更 |
 |------|------|
-| `core/base_component.py` | 新增 `_notify`、`_is_general_topic_msg`、`_cancel_flags`、`cancel()`、`_log_forward_result` |
-| `core/syncer.py` | 删除重复方法；新增 `_forward_restricted_unit`；takeout 懒加载；每条消息日志 |
-| `core/restricted_syncer.py` | 继承 ForwardingComponent；删除重复方法；转发循环加日志 |
+| `core/base_component.py` | 新增 `SyncComponentBase` 轻量基类；`ForwardingComponent` 改为继承它；新增 `_notify`、`_is_general_topic_msg`、`_cancel_flags`、`cancel()`、`_log_forward_result`、`_handle_collect_error`、`_ensure_supergroup_id` |
+| `core/syncer.py` | 删除重复方法（`_notify`、`_is_general_topic_msg`、`_cancel_flags`、`cancel()`、`_handle_collect_error`）；新增 `_forward_restricted_unit`；takeout 懒加载；每条消息日志 |
+| `core/restricted_syncer.py` | 继承 SyncComponentBase；删除重复方法；`_forward_restricted_batch` 中 `real_chat_id` 改用 `_ensure_supergroup_id`；转发循环加日志 |
 | `bot/handlers.py` | 无变更 |
 
 ### 不变的行为
