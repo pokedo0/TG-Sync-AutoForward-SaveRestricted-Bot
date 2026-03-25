@@ -7,7 +7,8 @@
 ## 功能特性
 
 - **链接解析** — 私聊发送 `t.me/...` 链接即可触发，支持公开/私有频道、群组、评论区、话题
-- **历史同步** — `/sync` 拉取历史消息，支持断点续传
+- **历史同步** — `/sync` 拉取历史消息，支持断点续传；受限消息自动通过 Takeout 内联转发
+- **受限消息补发** — `/syncrestrictedmsg` 通过 Telegram Takeout 导出接口，仅补发被平台限制的消息
 - **实时监控** — `/monitor` 监听新消息并自动转发
 - **多级降级** — Bot 直发 → UserBot 辅助 → 下载重传 → 失败标记 `#fail2forward`
 - **相册感知** — 优先整组发送，失败后逐条降级
@@ -44,7 +45,8 @@ python main.py
 
 | 命令 | 说明 |
 |------|------|
-| `/sync <链接> [--forward]` | 同步历史消息到当前会话（频道/群组/话题） |
+| `/sync <链接> [--forward]` | 同步历史消息到当前会话；受限消息通过 Takeout 内联转发 |
+| `/syncrestrictedmsg <链接>` | 通过 Takeout 导出接口仅补发受限消息到当前会话 |
 | `/monitor <链接> [--forward]` | 监控新消息并转发到当前会话（需 UserBot 已加入源） |
 | `/list` | 任务管理：暂停 / 恢复 / 删除 / 清空 |
 | `/settings` | 查看限流配置 |
@@ -54,13 +56,14 @@ python main.py
 
 ## 来源访问要求
 
-| 来源类型 | `/sync` 对 UserBot 的要求 | `/monitor` 对 UserBot 的要求 |
-|----------|--------------------------|------------------------------|
-| 公开频道 / 群组 | 通常无需加入 | **必须加入** |
-| 私密频道 / 群组 | 必须已加入且可读 | **必须已加入且可读** |
-| 群组话题（Forum） | 需能读取该群 | **必须加入** |
+| 来源类型 | `/sync` 对 UserBot 的要求 | `/monitor` 对 UserBot 的要求 | `/syncrestrictedmsg` 对 UserBot 的要求 |
+|----------|--------------------------|------------------------------|----------------------------------------|
+| 公开频道 / 群组 | 通常无需加入 | **必须加入** | 必须加入（Takeout 要求） |
+| 私密频道 / 群组 | 必须已加入且可读 | **必须已加入且可读** | 必须已加入且可读 |
+| 群组话题（Forum） | 需能读取该群 | **必须加入** | 需能读取该群 |
 
 - `/monitor` 创建任务前会校验 UserBot 是否已加入并可访问源，不满足会拒绝创建。
+- `/syncrestrictedmsg` 使用 Telegram Takeout 导出接口，要求 UserBot 已加入源。先扫描全部消息识别受限内容，再通过 Takeout 会话批量补发。
 - Bot 始终负责目标侧发送；来源侧读取能力取决于来源是否公开。
 
 ## 转发策略
@@ -104,6 +107,7 @@ docker compose up -d --build
 | `tg_forward_bot.link_parser` | 链接解析与 discussion 解析 |
 | `tg_forward_bot.forwarder` | 策略执行与降级 |
 | `tg_forward_bot.syncer` | 历史同步进度 |
+| `tg_forward_bot.restricted_syncer` | 受限消息 Takeout 同步 |
 | `tg_forward_bot.monitor` | 实时监控事件 |
 
 详细运维文档见 [`docs/operations.md`](docs/operations.md) 与 [`docs/architecture.md`](docs/architecture.md)。

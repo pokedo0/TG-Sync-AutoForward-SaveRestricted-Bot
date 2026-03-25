@@ -7,7 +7,8 @@ A Telethon-based Telegram message forwarding tool with a **Bot + UserBot** dual-
 ## Features
 
 - **Link Parsing** — Send a `t.me/...` link in private chat to trigger forwarding; supports public/private channels, groups, comments, and forum topics
-- **Historical Sync** — `/sync` pulls past messages with resumable progress tracking
+- **Historical Sync** — `/sync` pulls past messages with resumable progress tracking; restricted messages are automatically forwarded via Takeout inline
+- **Restricted Message Sync** — `/syncrestrictedmsg` re-exports only platform-restricted messages using Telegram's Takeout API
 - **Real-Time Monitoring** — `/monitor` watches for new messages and forwards them automatically
 - **Graceful Degradation** — Bot direct → UserBot-assisted → download & re-upload → failure marker `#fail2forward`
 - **Album-Aware** — Sends media groups as a batch first, falls back to per-message on failure
@@ -44,7 +45,8 @@ python main.py
 
 | Command | Description |
 |---------|-------------|
-| `/sync <link> [--forward]` | Sync historical messages to the current chat (channel / group / topic) |
+| `/sync <link> [--forward]` | Sync historical messages to the current chat; restricted messages are forwarded via Takeout inline |
+| `/syncrestrictedmsg <link>` | Re-export only restricted messages to the current chat via Takeout |
 | `/monitor <link> [--forward]` | Monitor new messages and forward to the current chat (UserBot must have joined the source) |
 | `/list` | Task management: pause / resume / delete / clear |
 | `/settings` | View rate-limit configuration |
@@ -54,13 +56,14 @@ Sending a `t.me/...` link in a private chat with the bot triggers parsing and fo
 
 ## Source Access Requirements
 
-| Source Type | UserBot for `/sync` | UserBot for `/monitor` |
-|-------------|---------------------|------------------------|
-| Public channel / group | Usually no membership required | **Must be a member** |
-| Private channel / group | Must be a member with read access | **Must be a member with read access** |
-| Forum topic | Must have read access to the group | **Must be a member** |
+| Source Type | UserBot for `/sync` | UserBot for `/monitor` | UserBot for `/syncrestrictedmsg` |
+|-------------|---------------------|------------------------|----------------------------------|
+| Public channel / group | Usually no membership required | **Must be a member** | Must be a member (Takeout requires it) |
+| Private channel / group | Must be a member with read access | **Must be a member with read access** | Must be a member with read access |
+| Forum topic | Must have read access to the group | **Must be a member** | Must have read access to the group |
 
 - `/monitor` validates UserBot membership and access before creating a task; the task is rejected if requirements are not met.
+- `/syncrestrictedmsg` uses Telegram's Takeout API, which requires UserBot to be a member of the source chat. It scans all messages first, then opens a Takeout session to re-export only the restricted ones.
 - Bot always handles target-side delivery; source-side readability depends on whether the source is public.
 
 ## Forwarding Strategy
@@ -104,6 +107,7 @@ Volume mounts:
 | `tg_forward_bot.link_parser` | Link resolution and discussion group discovery |
 | `tg_forward_bot.forwarder` | Strategy execution and fallback |
 | `tg_forward_bot.syncer` | Historical sync progress |
+| `tg_forward_bot.restricted_syncer` | Restricted message Takeout sync |
 | `tg_forward_bot.monitor` | Real-time monitoring events |
 
 For detailed operational guidance, see [`docs/operations.md`](docs/operations.md) and [`docs/architecture.md`](docs/architecture.md).
