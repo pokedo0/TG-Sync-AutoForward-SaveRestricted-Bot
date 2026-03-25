@@ -17,9 +17,9 @@ A Telethon-based Telegram message forwarding tool with a **Bot + UserBot** dual-
 
 ## Architecture
 
-| Role | Responsibility |
-|------|----------------|
-| **Bot** | Command handling, target-side delivery (write) |
+| Role        | Responsibility                                  |
+| ----------- | ----------------------------------------------- |
+| **Bot**     | Command handling, target-side delivery (write)  |
 | **UserBot** | Restricted-source access, media download (read) |
 
 Design principle: **UserBot reads, Bot writes** — UserBot only participates in write operations when necessary.
@@ -43,24 +43,24 @@ python main.py
 
 ## Commands
 
-| Command | Description |
-|---------|-------------|
-| `/sync <link> [--forward]` | Sync historical messages to the current chat; restricted messages are forwarded via Takeout inline |
-| `/syncrestrictedmsg <link>` | Re-export only restricted messages to the current chat via Takeout |
-| `/monitor <link> [--forward]` | Monitor new messages and forward to the current chat (UserBot must have joined the source) |
-| `/list` | Task management: pause / resume / delete / clear |
-| `/settings` | View rate-limit configuration |
-| `/start` · `/help` | Startup guide and help |
+| Command                       | Description                                                                                        |
+| ----------------------------- | -------------------------------------------------------------------------------------------------- |
+| `/sync <link> [--forward]`    | Sync historical messages to the current chat; restricted messages are forwarded via Takeout inline |
+| `/syncrestrictedmsg <link>`   | Re-export only restricted messages to the current chat via Takeout                                 |
+| `/monitor <link> [--forward]` | Monitor new messages and forward to the current chat (UserBot must have joined the source)         |
+| `/list`                       | Task management: pause / resume / delete / clear                                                   |
+| `/settings`                   | View rate-limit configuration                                                                      |
+| `/start` · `/help`            | Startup guide and help                                                                             |
 
 Sending a `t.me/...` link in a private chat with the bot triggers parsing and forwarding.
 
 ## Source Access Requirements
 
-| Source Type | UserBot for `/sync` | UserBot for `/monitor` | UserBot for `/syncrestrictedmsg` |
-|-------------|---------------------|------------------------|----------------------------------|
-| Public channel / group | Usually no membership required | **Must be a member** | Must be a member (Takeout requires it) |
-| Private channel / group | Must be a member with read access | **Must be a member with read access** | Must be a member with read access |
-| Forum topic | Must have read access to the group | **Must be a member** | Must have read access to the group |
+| Source Type             | UserBot for `/sync`                | UserBot for `/monitor`                | UserBot for `/syncrestrictedmsg`       |
+| ----------------------- | ---------------------------------- | ------------------------------------- | -------------------------------------- |
+| Public channel / group  | Usually no membership required     | **Must be a member**                  | Must be a member (Takeout requires it) |
+| Private channel / group | Must be a member with read access  | **Must be a member with read access** | Must be a member with read access      |
+| Forum topic             | Must have read access to the group | **Must be a member**                  | Must have read access to the group     |
 
 - `/monitor` validates UserBot membership and access before creating a task; the task is rejected if requirements are not met.
 - `/syncrestrictedmsg` uses Telegram's Takeout API, which requires UserBot to be a member of the source chat. It scans all messages first, then opens a Takeout session to re-export only the restricted ones.
@@ -85,14 +85,15 @@ docker compose up -d --build
 
 Volume mounts:
 
-| Host | Container |
-|------|-----------|
+| Host            | Container          |
+| --------------- | ------------------ |
 | `./config.yaml` | `/app/config.yaml` |
-| `./data` | `/app/data` |
-| `./sessions` | `/app/sessions` |
+| `./data`        | `/app/data`        |
+| `./sessions`    | `/app/sessions`    |
 
 ## Important Notes
 
+- **Restricted messages are sent as UserBot**: Takeout media references are bound to UserBot; Bot cannot use them directly.
 - `forward` mode preserves native forwarding semantics; `copy` mode is more compatible but may trigger rate limits faster
 - For private sources, UserBot must be a member with read access — otherwise strategies 2 and 3 will both fail
 - Forum topic forwarding relies on `target_topic_id`; insufficient permissions on the target side will cause delivery failures
@@ -101,13 +102,13 @@ Volume mounts:
 
 ## Logging & Troubleshooting
 
-| Logger | Purpose |
-|--------|---------|
-| `tg_forward_bot.handlers` | Command and private-chat parsing entry point |
-| `tg_forward_bot.link_parser` | Link resolution and discussion group discovery |
-| `tg_forward_bot.forwarder` | Strategy execution and fallback |
-| `tg_forward_bot.syncer` | Historical sync progress |
-| `tg_forward_bot.restricted_syncer` | Restricted message Takeout sync |
-| `tg_forward_bot.monitor` | Real-time monitoring events |
+| Logger                             | Purpose                                        |
+| ---------------------------------- | ---------------------------------------------- |
+| `tg_forward_bot.handlers`          | Command and private-chat parsing entry point   |
+| `tg_forward_bot.link_parser`       | Link resolution and discussion group discovery |
+| `tg_forward_bot.forwarder`         | Strategy execution and fallback                |
+| `tg_forward_bot.syncer`            | Historical sync progress                       |
+| `tg_forward_bot.restricted_syncer` | Restricted message Takeout sync                |
+| `tg_forward_bot.monitor`           | Real-time monitoring events                    |
 
 For detailed operational guidance, see [`docs/operations.md`](docs/operations.md) and [`docs/architecture.md`](docs/architecture.md).

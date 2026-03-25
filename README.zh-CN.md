@@ -17,9 +17,9 @@
 
 ## 架构
 
-| 角色 | 职责 |
-|------|------|
-| **Bot** | 命令交互、目标发送（写） |
+| 角色        | 职责                         |
+| ----------- | ---------------------------- |
+| **Bot**     | 命令交互、目标发送（写）     |
 | **UserBot** | 受限来源读取、媒体下载（读） |
 
 设计原则：**UserBot 读，Bot 写**，仅在必要时让 UserBot 参与写入。
@@ -43,24 +43,24 @@ python main.py
 
 ## 命令
 
-| 命令 | 说明 |
-|------|------|
-| `/sync <链接> [--forward]` | 同步历史消息到当前会话；受限消息通过 Takeout 内联转发 |
-| `/syncrestrictedmsg <链接>` | 通过 Takeout 导出接口仅补发受限消息到当前会话 |
-| `/monitor <链接> [--forward]` | 监控新消息并转发到当前会话（需 UserBot 已加入源） |
-| `/list` | 任务管理：暂停 / 恢复 / 删除 / 清空 |
-| `/settings` | 查看限流配置 |
-| `/start` · `/help` | 启动说明与帮助 |
+| 命令                          | 说明                                                  |
+| ----------------------------- | ----------------------------------------------------- |
+| `/sync <链接> [--forward]`    | 同步历史消息到当前会话；受限消息通过 Takeout 内联转发 |
+| `/syncrestrictedmsg <链接>`   | 通过 Takeout 导出接口仅补发受限消息到当前会话         |
+| `/monitor <链接> [--forward]` | 监控新消息并转发到当前会话（需 UserBot 已加入源）     |
+| `/list`                       | 任务管理：暂停 / 恢复 / 删除 / 清空                   |
+| `/settings`                   | 查看限流配置                                          |
+| `/start` · `/help`            | 启动说明与帮助                                        |
 
 私聊直接发送 `t.me/...` 链接即可触发解析与转发。
 
 ## 来源访问要求
 
-| 来源类型 | `/sync` 对 UserBot 的要求 | `/monitor` 对 UserBot 的要求 | `/syncrestrictedmsg` 对 UserBot 的要求 |
-|----------|--------------------------|------------------------------|----------------------------------------|
-| 公开频道 / 群组 | 通常无需加入 | **必须加入** | 必须加入（Takeout 要求） |
-| 私密频道 / 群组 | 必须已加入且可读 | **必须已加入且可读** | 必须已加入且可读 |
-| 群组话题（Forum） | 需能读取该群 | **必须加入** | 需能读取该群 |
+| 来源类型          | `/sync` 对 UserBot 的要求 | `/monitor` 对 UserBot 的要求 | `/syncrestrictedmsg` 对 UserBot 的要求 |
+| ----------------- | ------------------------- | ---------------------------- | -------------------------------------- |
+| 公开频道 / 群组   | 通常无需加入              | **必须加入**                 | 必须加入（Takeout 要求）               |
+| 私密频道 / 群组   | 必须已加入且可读          | **必须已加入且可读**         | 必须已加入且可读                       |
+| 群组话题（Forum） | 需能读取该群              | **必须加入**                 | 需能读取该群                           |
 
 - `/monitor` 创建任务前会校验 UserBot 是否已加入并可访问源，不满足会拒绝创建。
 - `/syncrestrictedmsg` 使用 Telegram Takeout 导出接口，要求 UserBot 已加入源。先扫描全部消息识别受限内容，再通过 Takeout 会话批量补发。
@@ -85,14 +85,15 @@ docker compose up -d --build
 
 挂载目录：
 
-| 宿主机 | 容器 |
-|--------|------|
+| 宿主机          | 容器               |
+| --------------- | ------------------ |
 | `./config.yaml` | `/app/config.yaml` |
-| `./data` | `/app/data` |
-| `./sessions` | `/app/sessions` |
+| `./data`        | `/app/data`        |
+| `./sessions`    | `/app/sessions`    |
 
 ## 注意事项
 
+- **受限消息由 UserBot 身份发出**：Takeout 获取的媒体引用绑定 UserBot，Bot 无法直接使用.
 - `forward` 模式保留原始转发语义；`copy` 模式兼容性更好但更容易触发限流
 - 私有来源必须确保 UserBot 已加入并可读，否则策略 2/3 均会失败
 - 话题转发依赖 `target_topic_id`，目标侧权限不足会导致发送失败
@@ -101,13 +102,13 @@ docker compose up -d --build
 
 ## 日志与排障
 
-| Logger | 用途 |
-|--------|------|
-| `tg_forward_bot.handlers` | 命令与私聊解析入口 |
-| `tg_forward_bot.link_parser` | 链接解析与 discussion 解析 |
-| `tg_forward_bot.forwarder` | 策略执行与降级 |
-| `tg_forward_bot.syncer` | 历史同步进度 |
-| `tg_forward_bot.restricted_syncer` | 受限消息 Takeout 同步 |
-| `tg_forward_bot.monitor` | 实时监控事件 |
+| Logger                             | 用途                       |
+| ---------------------------------- | -------------------------- |
+| `tg_forward_bot.handlers`          | 命令与私聊解析入口         |
+| `tg_forward_bot.link_parser`       | 链接解析与 discussion 解析 |
+| `tg_forward_bot.forwarder`         | 策略执行与降级             |
+| `tg_forward_bot.syncer`            | 历史同步进度               |
+| `tg_forward_bot.restricted_syncer` | 受限消息 Takeout 同步      |
+| `tg_forward_bot.monitor`           | 实时监控事件               |
 
 详细运维文档见 [`docs/operations.md`](docs/operations.md) 与 [`docs/architecture.md`](docs/architecture.md)。
