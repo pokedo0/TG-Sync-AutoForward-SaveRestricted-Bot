@@ -4,7 +4,7 @@ import logging
 
 from telethon import TelegramClient, events, errors, Button
 from telethon.tl import types
-from telethon.tl.functions.channels import GetParticipantRequest
+from telethon.tl.functions.channels import GetParticipantRequest, GetFullChannelRequest
 
 from bot.link_parser import (
     ParsedLink,
@@ -337,6 +337,42 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             target_msg_id = parsed.comment_id
             logger.info("评论链接 → 讨论群 %s 消息 %s", fetch_chat_id, parsed.comment_id)
         return FetchTarget(chat_id=fetch_chat_id, msg_id=target_msg_id)
+
+    async def _pre_warm_bot_cache(
+        parsed: ParsedLink, source_id: int, fetch_chat_id: int
+    ):
+        """尝试预热 Bot 实体缓存，使策略1(Bot直接)能命中。
+
+        在 handler 层仍持有原始用户名字符串 (parsed.chat_id)，
+        利用它让 Bot 主动向 Telegram 解析并缓存 access_hash。
+        """
+        # 已有缓存则跳过
+        try:
+            await bot.get_input_entity(fetch_chat_id)
+            return
+        except Exception:
+            pass
+
+        original_username = (
+            parsed.chat_id if isinstance(parsed.chat_id, str) else None
+        )
+        if not original_username:
+            return  # 私有链接(纯数字 ID)，无用户名可用
+
+        try:
+            channel_entity = await bot.get_entity(original_username)
+            logger.info("Bot 预热: 已解析 @%s", original_username)
+        except Exception as e:
+            logger.debug("Bot 预热 @%s 失败: %s", original_username, e)
+            return
+
+        # 评论链接: fetch_chat_id 是讨论群而非频道，需额外解析讨论群
+        if parsed.comment_id and fetch_chat_id != source_id:
+            try:
+                await bot(GetFullChannelRequest(channel_entity))
+                logger.info("Bot 预热: 已解析讨论群(来自 @%s)", original_username)
+            except Exception as e:
+                logger.debug("Bot 预热讨论群失败: %s", e)
 
     async def _forward_private_message(event, fetch_chat_id: int, msg,
                                        parsed: ParsedLink):
@@ -808,6 +844,9 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         if not fetch_target:
             await event.reply("❌ 无法获取频道的讨论群，评论消息无法解析")
             return
+
+        # 预热 Bot 实体缓存，让策略1尽量命中
+        await _pre_warm_bot_cache(parsed, source_id, fetch_target.chat_id)
 
         msg = await _fetch_private_target_message(event, fetch_target)
         if not msg:
