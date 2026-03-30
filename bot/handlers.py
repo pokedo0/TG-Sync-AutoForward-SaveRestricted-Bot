@@ -366,6 +366,12 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             logger.debug("Bot 预热 @%s 失败: %s", original_username, e)
             return
 
+        try:
+            await bot.get_input_entity(channel_entity)
+            logger.info("Bot 预热: 已缓存源 peer @%s", original_username)
+        except Exception as e:
+            logger.debug("Bot 预热源 peer 失败 @%s: %s", original_username, e)
+
         # 评论链接: fetch_chat_id 是讨论群而非频道，需额外解析讨论群
         if parsed.comment_id and fetch_chat_id != source_id:
             try:
@@ -373,6 +379,12 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
                 logger.info("Bot 预热: 已解析讨论群(来自 @%s)", original_username)
             except Exception as e:
                 logger.debug("Bot 预热讨论群失败: %s", e)
+            try:
+                discussion_entity = await bot.get_entity(fetch_chat_id)
+                await bot.get_input_entity(discussion_entity)
+                logger.info("Bot 预热: 已缓存讨论群 peer %s", fetch_chat_id)
+            except Exception as e:
+                logger.debug("Bot 预热讨论群 peer 失败 %s: %s", fetch_chat_id, e)
 
     async def _forward_private_message(event, fetch_chat_id: int, msg,
                                        parsed: ParsedLink):

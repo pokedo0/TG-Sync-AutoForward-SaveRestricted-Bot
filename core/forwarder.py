@@ -4,7 +4,9 @@ import logging
 import tempfile
 
 from telethon import TelegramClient, errors
+from telethon.tl.functions.channels import GetMessagesRequest
 from telethon.tl.types import Message
+from telethon.tl.types import Channel, InputMessageID
 
 from core.message_logic import (
     detect_hard_restriction,
@@ -162,7 +164,7 @@ class Forwarder:
                     target_chat_id, msg_id, source_ref,
                     **self._reply_kwargs(topic_id))
             else:
-                msg = await self._get_single_message(self.bot, source_ref, msg_id)
+                msg = await self._get_single_message_for_bot(source_chat_id, source_ref, msg_id)
                 if not msg:
                     logger.info("策略1: msg=%s Bot 无法获取消息", msg_id)
                     return None
@@ -191,7 +193,7 @@ class Forwarder:
                     target_chat_id, msg_ids, source_ref,
                     **self._reply_kwargs(topic_id))
             else:
-                msgs = await self._get_message_list(self.bot, source_ref, msg_ids)
+                msgs = await self._get_message_list_for_bot(source_chat_id, source_ref, msg_ids)
                 if not msgs:
                     logger.info("策略1相册: Bot 无法获取消息 %s", msg_ids)
                     return []
@@ -460,10 +462,51 @@ class Forwarder:
         msg = await client.get_messages(chat_or_entity, ids=msg_id)
         return msg if msg else None
 
+    async def _get_single_message_for_bot(
+        self,
+        source_chat_id,
+        chat_or_entity,
+        msg_id: int,
+    ) -> Message | None:
+        msg = await self._get_single_message(self.bot, chat_or_entity, msg_id)
+        if msg:
+            return msg
+        logger.info(
+            "策略1探测: 高层 get_messages 未命中 chat=%s msg=%s ref=%s",
+            source_chat_id, msg_id, self._describe_peer(chat_or_entity),
+        )
+        msgs = await self._raw_get_messages_for_bot(source_chat_id, chat_or_entity, [msg_id])
+        return msgs[0] if msgs else None
+
     async def _get_message_list(self, client: TelegramClient,
                                 chat_or_entity, msg_ids: list[int]) -> list[Message]:
         msgs = await client.get_messages(chat_or_entity, ids=msg_ids)
         return normalize_messages(msgs)
+
+    async def _get_message_list_for_bot(
+        self,
+        source_chat_id,
+        chat_or_entity,
+        msg_ids: list[int],
+    ) -> list[Message]:
+        msgs = await self._get_message_list(self.bot, chat_or_entity, msg_ids)
+        found_ids = {m.id for m in msgs if getattr(m, "id", None) is not None}
+        missing_ids = [mid for mid in msg_ids if mid not in found_ids]
+        if not missing_ids:
+            return msgs
+
+        logger.info(
+            "策略1探测: 高层 get_messages 部分未命中 chat=%s want=%s got=%s ref=%s missing=%s",
+            source_chat_id, msg_ids, sorted(found_ids), self._describe_peer(chat_or_entity), missing_ids,
+        )
+        raw_msgs = await self._raw_get_messages_for_bot(source_chat_id, chat_or_entity, missing_ids)
+        merged: dict[int, Message] = {
+            m.id: m for m in msgs if getattr(m, "id", None) is not None
+        }
+        for msg in raw_msgs:
+            if getattr(msg, "id", None) is not None:
+                merged[msg.id] = msg
+        return [merged[mid] for mid in msg_ids if mid in merged]
 
     @staticmethod
     def _clamp_part_size_kb(value) -> int:
@@ -491,4 +534,77 @@ class Forwarder:
             except Exception:
                 pass
         return source_chat_id
+
+    async def _raw_get_messages_for_bot(
+        self,
+        source_chat_id,
+        chat_or_entity,
+        msg_ids: list[int],
+    ) -> list[Message]:
+        input_channel = await self._resolve_input_channel_for_bot(chat_or_entity, source_chat_id)
+        if not input_channel:
+            logger.info(
+                "策略1探测: 无法构造 InputChannel chat=%s ref=%s",
+                source_chat_id, self._describe_peer(chat_or_entity),
+            )
+            return []
+
+        try:
+            result = await self.bot(GetMessagesRequest(
+                channel=input_channel,
+                id=[InputMessageID(mid) for mid in msg_ids],
+            ))
+        except Exception as e:
+            logger.info(
+                "策略1探测: channels.getMessages 失败 chat=%s msg_ids=%s peer=%s err=%s",
+                source_chat_id, msg_ids, self._describe_peer(input_channel), e,
+            )
+            return []
+
+        messages = normalize_messages(getattr(result, "messages", None))
+        valid = [
+            m for m in messages
+            if getattr(m, "id", None) is not None and type(m).__name__ != "MessageEmpty"
+        ]
+        logger.info(
+            "策略1探测: channels.getMessages chat=%s msg_ids=%s peer=%s -> %s",
+            source_chat_id, msg_ids, self._describe_peer(input_channel),
+            [getattr(m, "id", None) for m in valid],
+        )
+        return valid
+
+    async def _resolve_input_channel_for_bot(self, chat_or_entity, source_chat_id):
+        candidates = [chat_or_entity]
+        if source_chat_id not in candidates:
+            candidates.append(source_chat_id)
+
+        for candidate in candidates:
+            try:
+                input_peer = await self.bot.get_input_entity(candidate)
+            except Exception:
+                continue
+            if hasattr(input_peer, "channel_id") and hasattr(input_peer, "access_hash"):
+                return input_peer
+
+        try:
+            entity = await self.bot.get_entity(chat_or_entity)
+        except Exception:
+            entity = None
+        if isinstance(entity, Channel):
+            try:
+                return await self.bot.get_input_entity(entity)
+            except Exception:
+                pass
+        return None
+
+    @staticmethod
+    def _describe_peer(peer) -> str:
+        if peer is None:
+            return "None"
+        fields = []
+        for name in ("channel_id", "chat_id", "user_id", "access_hash", "username", "title"):
+            value = getattr(peer, name, None)
+            if value is not None:
+                fields.append(f"{name}={value}")
+        return f"{type(peer).__name__}({', '.join(fields)})" if fields else type(peer).__name__
 
