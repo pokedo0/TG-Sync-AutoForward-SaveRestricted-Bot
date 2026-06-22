@@ -60,7 +60,9 @@ User=${CURRENT_USER}
 WorkingDirectory=${APP_DIR}
 ExecStart=${APP_DIR}/venv/bin/python ${APP_DIR}/main.py
 Restart=on-failure
-RestartSec=10
+RestartSec=30
+StartLimitIntervalSec=600
+StartLimitBurst=10
 
 [Install]
 WantedBy=multi-user.target
