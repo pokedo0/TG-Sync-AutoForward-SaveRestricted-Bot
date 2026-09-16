@@ -38,6 +38,16 @@ class MediaTransferHelper:
         attrs = getattr(document, "attributes", None)
         return attrs or None
 
+    @classmethod
+    def ensure_video_streaming(cls, msg: Message):
+        """若消息包含视频文档属性，确保其 supports_streaming 标志为 True。"""
+        attrs = cls.get_document_attributes(msg)
+        if not attrs:
+            return
+        for attr in attrs:
+            if isinstance(attr, DocumentAttributeVideo):
+                attr.supports_streaming = True
+
     @staticmethod
     def _has_document_thumbs(msg: Message) -> bool:
         media = getattr(msg, "media", None)
@@ -86,6 +96,7 @@ class MediaTransferHelper:
         }
         if self.is_video_message(msg):
             kwargs["supports_streaming"] = True
+            self.ensure_video_streaming(msg)
             attrs = self.get_document_attributes(msg)
             if attrs:
                 kwargs["attributes"] = attrs

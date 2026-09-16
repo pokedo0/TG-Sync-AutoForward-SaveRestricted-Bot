@@ -18,6 +18,7 @@ from core.message_logic import (
     is_chat_globally_restricted,
     is_file_media,
 )
+from core.media_transfer import MediaTransferHelper
 from db.database import Database
 from db import models
 
@@ -39,11 +40,22 @@ class RestrictedSyncer(SyncComponentBase):
         """通过 Takeout 会话复制单条消息到目标群。"""
         reply_to = topic_id if topic_id else None
         if is_file_media(msg):
+            send_kwargs = {}
+            is_video = MediaTransferHelper.is_video_message(msg)
+            if is_video:
+                send_kwargs["supports_streaming"] = True
+                MediaTransferHelper.ensure_video_streaming(msg)
+                attrs = MediaTransferHelper.get_document_attributes(msg)
+                if attrs:
+                    send_kwargs["attributes"] = attrs
+            logger.info("受限单条复制: msg=%s has_video=%s supports_streaming=%s",
+                        msg.id, is_video, bool(send_kwargs.get("supports_streaming")))
             result = await takeout.send_file(
                 target_chat_id, msg.media,
                 caption=msg.text or "",
                 formatting_entities=msg.entities,
                 reply_to=reply_to,
+                **send_kwargs,
             )
         elif msg.text:
             result = await takeout.send_message(
@@ -63,21 +75,44 @@ class RestrictedSyncer(SyncComponentBase):
         media_msgs = [m for m in msgs if is_file_media(m)]
         if not media_msgs:
             return []
+
+        has_video = any(MediaTransferHelper.is_video_message(m) for m in media_msgs)
+        for m in media_msgs:
+            if MediaTransferHelper.is_video_message(m):
+                MediaTransferHelper.ensure_video_streaming(m)
+
         if len(media_msgs) == 1:
             m = media_msgs[0]
+            send_kwargs = {}
+            is_video = MediaTransferHelper.is_video_message(m)
+            if is_video:
+                send_kwargs["supports_streaming"] = True
+                attrs = MediaTransferHelper.get_document_attributes(m)
+                if attrs:
+                    send_kwargs["attributes"] = attrs
+            logger.info("受限相册单条复制: msg=%s has_video=%s supports_streaming=%s",
+                        m.id, is_video, bool(send_kwargs.get("supports_streaming")))
             result = await takeout.send_file(
                 target_chat_id, m.media,
                 caption=m.text or "",
                 formatting_entities=m.entities,
                 reply_to=reply_to,
+                **send_kwargs,
             )
             return [result.id] if result else []
+
         files = [m.media for m in media_msgs]
         captions = [m.text or "" for m in media_msgs]
+        send_kwargs = {}
+        if has_video:
+            send_kwargs["supports_streaming"] = True
+        logger.info("受限相册多条复制: count=%d has_video=%s supports_streaming=%s",
+                    len(media_msgs), has_video, bool(send_kwargs.get("supports_streaming")))
         result = await takeout.send_file(
             target_chat_id, files,
             caption=captions,
             reply_to=reply_to,
+            **send_kwargs,
         )
         if not result:
             return []

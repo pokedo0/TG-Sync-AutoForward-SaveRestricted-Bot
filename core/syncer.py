@@ -68,7 +68,8 @@ class Syncer(ForwardingComponent):
         """转发普通消息单元，返回 (msg_count, last_msg_id, target_ids)。"""
         if unit_kind == "album":
             target_ids = await self.forwarder.forward_album(
-                source_chat_id, source_ids, target_chat_id, mode, target_topic_id
+                source_chat_id, source_ids, target_chat_id, mode, target_topic_id,
+                caller="syncer"
             )
             for src_id, tgt_id in zip(source_ids, target_ids):
                 await models.save_message_map(self.db, task_id, src_id, tgt_id)
@@ -76,7 +77,8 @@ class Syncer(ForwardingComponent):
 
         source_msg_id = source_ids[0]
         target_msg_id = await self.forwarder.forward_message(
-            source_chat_id, source_msg_id, target_chat_id, mode, target_topic_id
+            source_chat_id, source_msg_id, target_chat_id, mode, target_topic_id,
+            caller="syncer"
         )
         if target_msg_id:
             await models.save_message_map(self.db, task_id, source_msg_id, target_msg_id)

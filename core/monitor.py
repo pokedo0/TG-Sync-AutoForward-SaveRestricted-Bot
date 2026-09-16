@@ -64,7 +64,8 @@ class MonitorManager(ForwardingComponent):
                                 target_chat_id: int, mode: str,
                                 target_topic_id: int | None):
         target_msg_id = await self.forwarder.forward_message(
-            source_chat_id, source_msg_id, target_chat_id, mode, target_topic_id)
+            source_chat_id, source_msg_id, target_chat_id, mode, target_topic_id,
+            caller="monitor")
         if target_msg_id:
             await models.save_message_map(self.db, task_id, source_msg_id, target_msg_id)
 
@@ -100,7 +101,8 @@ class MonitorManager(ForwardingComponent):
         logger.info("监控 #%s 聚合相册 grouped_id=%s 条数=%s",
                     task_id, grouped_id, len(msg_ids))
         target_msg_ids = await self.forwarder.forward_album(
-            source_chat_id, msg_ids, target_chat_id, mode, target_topic_id)
+            source_chat_id, msg_ids, target_chat_id, mode, target_topic_id,
+            caller="monitor")
         for src_id, tgt_id in zip(msg_ids, target_msg_ids):
             await models.save_message_map(self.db, task_id, src_id, tgt_id)
 

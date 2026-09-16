@@ -399,7 +399,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             source_ids = [m.id for m in album_msgs]
             target_ids = await forwarder.forward_album(
                 fetch_chat_id, source_ids, event.chat_id, mode="copy",
-                target_topic_id=reply_to_id)
+                target_topic_id=reply_to_id, caller="private")
             if not target_ids:
                 await event.reply("❌ 转发失败，已尝试所有策略")
             return
@@ -411,7 +411,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
                 logger.info("纯文本消息")
             target_id = await forwarder.forward_message(
                 fetch_chat_id, msg.id, event.chat_id, mode="copy",
-                target_topic_id=reply_to_id)
+                target_topic_id=reply_to_id, caller="private")
             if not target_id:
                 await event.reply("❌ 转发失败，已尝试所有策略")
             return
