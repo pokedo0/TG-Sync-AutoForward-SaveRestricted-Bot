@@ -37,3 +37,7 @@ transfer:
 
 # 是否允许非管理员使用链接解析
 allow_public_resolve: true
+
+# 私聊解析返回消息时，是否在文字末尾嵌入原消息来源链接（格式：[Source Link](url)）
+append_source_link: true
+

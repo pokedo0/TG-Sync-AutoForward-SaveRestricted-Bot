@@ -1,6 +1,8 @@
 """Bot 命令处理器：注册所有 Telegram Bot 命令。"""
 import asyncio
+import html
 import logging
+import re
 
 from telethon import TelegramClient, events, errors, Button
 from telethon.tl import types
@@ -25,7 +27,9 @@ from bot.telegram_utils import (
 from core.message_logic import (
     classify_message_kind,
     collect_album_messages,
+    is_file_media,
 )
+from core.base_component import SyncComponentBase
 from core.syncer import Syncer
 from core.restricted_syncer import RestrictedSyncer
 from core.monitor import MonitorManager
@@ -42,6 +46,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
                       userbot_manager: UserBotManager | None = None):
     admin_ids = set(config.get("admin_ids", []))
     allow_public = config.get("allow_public_resolve", False)
+    append_source_link = config.get("append_source_link", False)
     syncer = Syncer(bot, userbot, db, config, userbot_manager=userbot_manager)
     restricted_syncer = RestrictedSyncer(bot, userbot, db, config, userbot_manager=userbot_manager)
     forwarder = monitor_manager.forwarder
@@ -404,9 +409,86 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             except Exception as e:
                 logger.debug("Bot 预热讨论群 peer 失败 %s: %s", fetch_chat_id, e)
 
+    def _build_source_url(raw_text: str, parsed: ParsedLink, source_id: int) -> str:
+        raw_link = extract_tg_link(raw_text)
+        if raw_link:
+            cleaned = re.sub(r'([?&])single\b(=[^&]*)?', '', raw_link)
+            cleaned = cleaned.replace("?&", "?").rstrip("?&")
+            if cleaned.startswith("http://") or cleaned.startswith("https://"):
+                return cleaned
+        if parsed.is_private:
+            clean_id = str(source_id).replace("-100", "").lstrip("-")
+            if parsed.topic_id:
+                url = f"https://t.me/c/{clean_id}/{parsed.topic_id}/{parsed.msg_id}"
+            else:
+                url = f"https://t.me/c/{clean_id}/{parsed.msg_id}"
+        else:
+            if parsed.topic_id:
+                url = f"https://t.me/{parsed.chat_id}/{parsed.topic_id}/{parsed.msg_id}"
+            else:
+                url = f"https://t.me/{parsed.chat_id}/{parsed.msg_id}"
+        if parsed.comment_id:
+            url += f"?comment={parsed.comment_id}"
+        return url
+
+    async def _append_link_to_target(target_chat_id: int, target_msg_id: int,
+                                     base_text: str, source_url: str,
+                                     is_media: bool = False):
+        link_tag = f"[Source Link]({source_url})"
+        max_len = 1024 if is_media else 4096
+        base = base_text or ""
+        if base:
+            combined = f"{base}\n\n{link_tag}"
+            if len(combined) > max_len:
+                overflow = len(combined) - max_len
+                cut_len = max(0, len(base) - overflow - 3)
+                base = base[:cut_len] + "..."
+                combined = f"{base}\n\n{link_tag}"
+        else:
+            combined = link_tag
+
+        logger.info("私聊来源链接准备追加: target_msg=%s is_media=%s source_url=%s",
+                    target_msg_id, is_media, source_url)
+        try:
+            await bot.edit_message(
+                target_chat_id, target_msg_id,
+                text=combined,
+                parse_mode="md",
+                link_preview=False,
+            )
+            logger.info("私聊来源链接追加成功: target_msg=%s", target_msg_id)
+        except errors.MessageNotModifiedError:
+            pass
+        except Exception as e:
+            logger.warning("私聊编辑追加 Markdown 来源链接失败 (%s: %s)，尝试 HTML 回退",
+                           type(e).__name__, e)
+            try:
+                html_link = f'<a href="{html.escape(source_url)}">Source Link</a>'
+                if base:
+                    esc_base = html.escape(base)
+                    html_combined = f"{esc_base}\n\n{html_link}"
+                    if len(html_combined) > max_len:
+                        overflow = len(html_combined) - max_len
+                        cut_len = max(0, len(esc_base) - overflow - 3)
+                        esc_base = esc_base[:cut_len] + "..."
+                        html_combined = f"{esc_base}\n\n{html_link}"
+                else:
+                    html_combined = html_link
+
+                await bot.edit_message(
+                    target_chat_id, target_msg_id,
+                    text=html_combined,
+                    parse_mode="html",
+                    link_preview=False,
+                )
+                logger.info("私聊来源链接 HTML 回退追加成功: target_msg=%s", target_msg_id)
+            except Exception as e2:
+                logger.warning("私聊追加来源链接失败: target_msg=%s, err=%s", target_msg_id, e2)
+
     async def _forward_private_message(event, fetch_chat_id: int, msg,
                                        parsed: ParsedLink,
-                                       client: TelegramClient | None = None):
+                                       client: TelegramClient | None = None,
+                                       source_url: str | None = None):
         """私聊链接解析后的统一转发逻辑。"""
         ub = client or userbot
         reply_to_id = event.message.id
@@ -422,6 +504,18 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
                 target_topic_id=reply_to_id, caller="private", userbot=ub)
             if not target_ids:
                 await event.reply("❌ 转发失败，已尝试所有策略")
+                return
+
+            if append_source_link and source_url and target_ids:
+                # 寻找原相册中带有 caption 的索引，若全无则默认取第 1 条 (index 0)
+                caption_idx = 0
+                for idx, m in enumerate(album_msgs):
+                    if m.text:
+                        caption_idx = idx
+                        break
+                target_msg_id = target_ids[caption_idx] if caption_idx < len(target_ids) else target_ids[0]
+                base_text = album_msgs[caption_idx].text if caption_idx < len(album_msgs) else ""
+                await _append_link_to_target(event.chat_id, target_msg_id, base_text or "", source_url, is_media=True)
             return
 
         if kind in ("media", "text"):
@@ -434,6 +528,11 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
                 target_topic_id=reply_to_id, caller="private", userbot=ub)
             if not target_id:
                 await event.reply("❌ 转发失败，已尝试所有策略")
+                return
+
+            if append_source_link and source_url and target_id:
+                is_media = (kind == "media")
+                await _append_link_to_target(event.chat_id, target_id, msg.text or "", source_url, is_media=is_media)
             return
 
         await event.reply("❌ 消息内容为空")
@@ -492,6 +591,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             "• 私聊发链接 → 解析受限内容\n"
             "• /sync <链接> → 同步历史消息到当前群\n"
             "• /syncrestrictedmsg <链接> → 通过 Takeout导出数据接口 补发受限消息\n"
+            "• /takeout <链接> → 通过 Takeout导出数据接口 解析单条消息/相册\n"
             "• /monitor <链接> → 监控新消息转发到当前群（需 UserBot 先加入源）\n"
             "• /list → 管理所有任务\n"
             "• /settings → 查看配置")
@@ -502,6 +602,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             "📖 使用说明:\n\n"
             "/sync <链接> [--forward] — 同步源历史到当前群\n"
             "/syncrestrictedmsg <链接> — 通过 Takeout导出数据接口 补发受限消息到当前群\n"
+            "/takeout <链接> — 通过 Takeout导出数据接口 解析单条消息/相册到当前群\n"
             "/monitor <链接> [--forward] — 监控源新消息到当前群（要求 UserBot 已加入源）\n"
             "/list — 管理所有任务（含暂停/恢复/删除）\n"
             "/settings — 查看限流配置\n\n"
@@ -621,6 +722,150 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             userbot=active_ub,
         ))
         _sync_tasks[task_id] = task
+
+    @bot.on(events.NewMessage(pattern=r"^/takeout(?:@\w+)?(?:\s+(.+))?$"))
+    async def on_takeout(event):
+        """通过 Takeout 导出接口解析单条链接或回复消息。"""
+        if event.is_private:
+            if not allow_public and not is_admin(event.sender_id):
+                await event.reply("⛔ 无权限使用此命令")
+                return
+        else:
+            if not await _require_admin(event):
+                return
+
+        link = extract_tg_link(event.raw_text)
+        if not link and event.is_reply:
+            reply = await event.get_reply_message()
+            if reply and reply.raw_text:
+                link = extract_tg_link(reply.raw_text)
+
+        if not link:
+            await event.reply("❌ 请提供有效的 Telegram 消息链接，或回复包含链接的消息。\n格式：`/takeout <链接>`")
+            return
+
+        parsed = parse_link(link)
+        if not parsed or not parsed.msg_id:
+            await event.reply("❌ 无法解析链接，链接中必须包含消息 ID")
+            return
+
+        source_id = await resolve_chat_id(userbot, parsed)
+        if not source_id:
+            await event.reply("❌ 无法访问源频道/群组")
+            return
+
+        fetch_target = await _resolve_private_fetch_target(parsed, source_id)
+        if not fetch_target:
+            await event.reply("❌ 无法获取讨论群实体，评论链接无法解析")
+            return
+
+        # 多 UserBot 按配置优先顺序探测（第 1 轮 Session 本地缓存命中，第 2 轮 dialogs 刷新命中）
+        active_ub = userbot
+        if userbot_manager:
+            active_ub, err_msg = await userbot_manager.resolve_accessible_userbot(
+                fetch_target.chat_id, fetch_target.msg_id
+            )
+            if not active_ub:
+                await event.reply(f"❌ {err_msg or '所有配置的 UserBot 均未加入该私有频道/群组，无法访问'}")
+                return
+
+        phone = getattr(active_ub, "_phone", "default")
+        ub_idx = getattr(active_ub, "_userbot_index", 1)
+        source_desc = await _describe_source_for_display(source_id, parsed, client=active_ub)
+        logger.info("收到 /takeout 命令: user=%s chat=%s 源=%s msg=%s (UserBot: #%d %s)",
+                    event.sender_id, event.chat_id, source_desc, fetch_target.msg_id, ub_idx, phone)
+
+        target_chat_id = event.chat_id
+        target_topic_id = get_target_topic_id(event)
+        real_chat_id = SyncComponentBase._ensure_supergroup_id(fetch_target.chat_id)
+        source_url = _build_source_url(link, parsed, source_id)
+
+        try:
+            logger.info("正在启动 UserBot #%d [%s] 的 Takeout 会话...", ub_idx, phone)
+            async with active_ub.takeout() as takeout:
+                logger.info("Takeout 会话已建立，拉取目标消息 real_chat=%s msg_id=%s...",
+                            real_chat_id, fetch_target.msg_id)
+                msg = await takeout.get_messages(real_chat_id, ids=fetch_target.msg_id)
+                if not msg:
+                    await event.reply("❌ 消息不存在或无法通过 Takeout 获取")
+                    return
+
+                kind = classify_message_kind(msg, single=parsed.single)
+                if kind == "album":
+                    album_msgs = await collect_album_messages(
+                        takeout, real_chat_id, msg, window=10
+                    )
+                    logger.info("Takeout 媒体集合: %d 条, grouped_id=%s",
+                                len(album_msgs), msg.grouped_id)
+
+                    if append_source_link and source_url:
+                        caption_idx = 0
+                        for idx, m in enumerate(album_msgs):
+                            if m.text:
+                                caption_idx = idx
+                                break
+                        base = album_msgs[caption_idx].text or ""
+                        link_tag = f"[Source Link]({source_url})"
+                        new_text = f"{base}\n\n{link_tag}" if base else link_tag
+                        if len(new_text) > 1024:
+                            overflow = len(new_text) - 1024
+                            cut_len = max(0, len(base) - overflow - 3)
+                            base = base[:cut_len] + "..."
+                            new_text = f"{base}\n\n{link_tag}"
+                        album_msgs[caption_idx].message = new_text
+                        album_msgs[caption_idx]._text = new_text
+                        album_msgs[caption_idx].entities = None
+
+                    target_ids = await RestrictedSyncer._copy_album(
+                        takeout, album_msgs, target_chat_id, target_topic_id
+                    )
+                    if not target_ids:
+                        await event.reply("❌ Takeout 相册发送失败")
+                    else:
+                        logger.info("✅ Takeout 相册发送成功: %s", target_ids)
+                    return
+
+                if kind in ("media", "text"):
+                    if append_source_link and source_url:
+                        base = msg.text or ""
+                        link_tag = f"[Source Link]({source_url})"
+                        max_len = 1024 if is_file_media(msg) else 4096
+                        new_text = f"{base}\n\n{link_tag}" if base else link_tag
+                        if len(new_text) > max_len:
+                            overflow = len(new_text) - max_len
+                            cut_len = max(0, len(base) - overflow - 3)
+                            base = base[:cut_len] + "..."
+                            new_text = f"{base}\n\n{link_tag}"
+                        msg.message = new_text
+                        msg._text = new_text
+                        msg.entities = None
+
+                    target_id = await RestrictedSyncer._copy_single(
+                        takeout, msg, target_chat_id, target_topic_id
+                    )
+                    if not target_id:
+                        await event.reply("❌ Takeout 消息发送失败")
+                    else:
+                        logger.info("✅ Takeout 消息发送成功: %s", target_id)
+                    return
+
+                await event.reply("❌ 消息内容为空")
+
+        except errors.TakeoutInitDelayError as e:
+            logger.warning("Takeout 启动延迟: 需要等待 %s 秒", e.seconds)
+            await event.reply(f"⚠️ Telegram Takeout 初始化限制：需等待 {e.seconds} 秒，或需在官方客户端确认导出授权。")
+        except errors.ChatForwardsRestrictedError:
+            logger.warning("Takeout 仍提示转发受限")
+            await event.reply("❌ Takeout 转发失败：来源受限或目标群组无法接收")
+        except errors.UserPrivacyRestrictedError:
+            logger.warning("用户隐私设置限制私聊")
+            await event.reply("❌ 发送失败：目标用户的隐私设置不允许 UserBot 发送私聊消息")
+        except errors.FloodWaitError as e:
+            logger.warning("Takeout 触发 FloodWait: %s秒", e.seconds)
+            await event.reply(f"⏳ 触发 Telegram 频率限制，请等待 {e.seconds} 秒后重试")
+        except Exception as e:
+            logger.error("Takeout 执行异常: %s", e, exc_info=True)
+            await event.reply(f"❌ Takeout 处理失败: {e}")
 
     @bot.on(events.NewMessage(pattern=r"/monitor(?:@\w+)?\s+"))
     async def on_monitor(event):
@@ -914,7 +1159,8 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         # 预热 Bot 实体缓存，让策略1尽量命中
         await _pre_warm_bot_cache(parsed, source_id, fetch_target.chat_id)
 
+        source_url = _build_source_url(event.raw_text, parsed, source_id)
         msg = await _fetch_private_target_message(event, fetch_target, client=active_ub)
         if not msg:
             return
-        await _forward_private_message(event, fetch_target.chat_id, msg, parsed, client=active_ub)
+        await _forward_private_message(event, fetch_target.chat_id, msg, parsed, client=active_ub, source_url=source_url)
