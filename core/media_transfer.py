@@ -24,15 +24,15 @@ class MediaTransferHelper:
         self.upload_part_size_kb = upload_part_size_kb
         self.download_part_size_kb = download_part_size_kb
         self.enable_fast_transfer = enable_fast_transfer
-        default_conn = max(2, min(8, int(fast_transfer_connections)))
+        default_conn = max(1, int(fast_transfer_connections))
         self.fast_transfer_connections = default_conn
         self.fast_download_connections = (
-            max(2, min(8, int(fast_download_connections)))
+            max(1, int(fast_download_connections))
             if fast_download_connections is not None
             else default_conn
         )
         self.fast_upload_connections = (
-            max(2, min(8, int(fast_upload_connections)))
+            max(1, int(fast_upload_connections))
             if fast_upload_connections is not None
             else default_conn
         )

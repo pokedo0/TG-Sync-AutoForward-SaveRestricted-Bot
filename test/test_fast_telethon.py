@@ -20,14 +20,14 @@ from telethon import types
 
 class TestFastTelethon(unittest.IsolatedAsyncioTestCase):
     def test_clamp_connections(self):
-        """测试并发连接数约束在 [2, 8] 之间。"""
-        self.assertEqual(clamp_connections(1), 2)
-        self.assertEqual(clamp_connections(0), 2)
-        self.assertEqual(clamp_connections(-5), 2)
+        """测试并发连接数仅约束下限（>=1），不设硬编码上限。"""
+        self.assertEqual(clamp_connections(1), 1)
+        self.assertEqual(clamp_connections(0), 1)
+        self.assertEqual(clamp_connections(-5), 1)
         self.assertEqual(clamp_connections(4), 4)
         self.assertEqual(clamp_connections(8), 8)
-        self.assertEqual(clamp_connections(16), 8)
-        self.assertEqual(clamp_connections(32), 8)
+        self.assertEqual(clamp_connections(16), 16)
+        self.assertEqual(clamp_connections(32), 32)
         self.assertEqual(clamp_connections("abc"), 4)
         self.assertEqual(clamp_connections(None), 4)
 

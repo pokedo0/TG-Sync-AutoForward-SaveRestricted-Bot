@@ -20,18 +20,17 @@ logger = logging.getLogger("tg_forward_bot.fast_telethon")
 
 PART_SIZE = 512 * 1024  # 512 KB 分片（Telegram MTProto 允许的最大分片）
 MIN_PARALLEL_FILE_SIZE = 10 * 1024 * 1024  # 10 MB（低于此体积并发握手得不偿失，直接走原生）
-MAX_CONNECTIONS = 8
-MIN_CONNECTIONS = 2
+MIN_CONNECTIONS = 1
 DEFAULT_CONNECTIONS = 4
 
 
 def clamp_connections(n: int) -> int:
-    """约束并发连接数在 [MIN_CONNECTIONS, MAX_CONNECTIONS] 区间。"""
+    """约束并发连接数下限（至少 1 条），不设硬编码上限，完全由配置决定。"""
     try:
         val = int(n)
     except (ValueError, TypeError):
         val = DEFAULT_CONNECTIONS
-    return max(MIN_CONNECTIONS, min(MAX_CONNECTIONS, val))
+    return max(MIN_CONNECTIONS, val)
 
 
 async def _acquire_senders(client: TelegramClient, dc_id: int, count: int) -> tuple[list, any]:
