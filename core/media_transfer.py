@@ -16,16 +16,33 @@ class MediaTransferHelper:
                  upload_part_size_kb: int, download_part_size_kb: int,
                  enable_fast_transfer: bool = True,
                  fast_transfer_connections: int = 4,
-                 fast_transfer_min_size_mb: int = 10):
+                 fast_transfer_min_size_mb: int = 10,
+                 fast_download_connections: int | None = None,
+                 fast_upload_connections: int | None = None):
         self.bot = bot
         self.userbot = userbot
         self.upload_part_size_kb = upload_part_size_kb
         self.download_part_size_kb = download_part_size_kb
         self.enable_fast_transfer = enable_fast_transfer
-        self.fast_transfer_connections = max(2, min(8, int(fast_transfer_connections)))
+        default_conn = max(2, min(8, int(fast_transfer_connections)))
+        self.fast_transfer_connections = default_conn
+        self.fast_download_connections = (
+            max(2, min(8, int(fast_download_connections)))
+            if fast_download_connections is not None
+            else default_conn
+        )
+        self.fast_upload_connections = (
+            max(2, min(8, int(fast_upload_connections)))
+            if fast_upload_connections is not None
+            else default_conn
+        )
         self.fast_transfer_min_size_mb = max(1, int(fast_transfer_min_size_mb))
         self._large_download_lock = asyncio.Lock()
         self._large_upload_lock = asyncio.Lock()
+        logger.info(
+            "[MediaTransfer] 初始化配置: enable_fast=%s, download_conn=%d, upload_conn=%d, min_size=%dMB",
+            self.enable_fast_transfer, self.fast_download_connections, self.fast_upload_connections, self.fast_transfer_min_size_mb
+        )
 
     @staticmethod
     def is_video_message(msg: Message) -> bool:
@@ -159,14 +176,14 @@ class MediaTransferHelper:
                     try:
                         logger.info(
                             "[MediaTransfer] 尝试 FastTelethon 并发下载: msg_id=%s, 大小=%.2f MB (独占 %d 连接)",
-                            msg.id, file_size / (1024 * 1024), self.fast_transfer_connections,
+                            msg.id, file_size / (1024 * 1024), self.fast_download_connections,
                         )
                         res_path = await fast_download_file(
                             client=ub,
                             location=msg,
                             out_file_path=path,
                             file_size=file_size,
-                            connection_count=self.fast_transfer_connections,
+                            connection_count=self.fast_download_connections,
                         )
                         if res_path and os.path.exists(res_path) and os.path.getsize(res_path) > 0:
                             return res_path
@@ -228,12 +245,12 @@ class MediaTransferHelper:
                     async with self._large_upload_lock:
                         logger.info(
                             "[MediaTransfer] 尝试 FastTelethon 并发上传: 文件=%s, 大小=%.2f MB (独占 %d 连接)",
-                            os.path.basename(file_path), file_size / (1024 * 1024), self.fast_transfer_connections,
+                            os.path.basename(file_path), file_size / (1024 * 1024), self.fast_upload_connections,
                         )
                         input_file = await fast_upload_file(
                             client=self.bot,
                             file_path=file_path,
-                            connection_count=self.fast_transfer_connections,
+                            connection_count=self.fast_upload_connections,
                         )
                         if input_file:
                             return input_file

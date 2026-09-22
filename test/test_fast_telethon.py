@@ -465,6 +465,76 @@ class TestFastTelethon(unittest.IsolatedAsyncioTestCase):
                 # 核心断言：同一瞬间最多只有 1 个大文件在下载，连接数严格控制在 5
                 self.assertEqual(max_concurrent_downloads, 1)
 
+    async def test_separated_download_and_upload_connections(self):
+        """测试上传与下载并发连接数可以独立设置并生效。"""
+        mock_bot = MagicMock()
+        mock_bot.send_file = AsyncMock(return_value=MagicMock(id=888))
+        mock_ub = MagicMock()
+
+        # 1. 独立配置场景
+        helper_split = MediaTransferHelper(
+            bot=mock_bot,
+            userbot=mock_ub,
+            upload_part_size_kb=512,
+            download_part_size_kb=512,
+            enable_fast_transfer=True,
+            fast_transfer_connections=4,
+            fast_transfer_min_size_mb=10,
+            fast_download_connections=7,
+            fast_upload_connections=3,
+        )
+        self.assertEqual(helper_split.fast_download_connections, 7)
+        self.assertEqual(helper_split.fast_upload_connections, 3)
+
+        mock_msg = MagicMock(spec=types.Message)
+        mock_msg.id = 100
+        mock_file = MagicMock()
+        mock_file.size = 15 * 1024 * 1024
+        mock_file.name = "split_test.mp4"
+        mock_file.ext = ".mp4"
+        mock_msg.file = mock_file
+        mock_msg.media = None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_file = os.path.join(tmpdir, "split_test.mp4")
+            with open(out_file, "wb") as f:
+                f.write(b"S" * (15 * 1024 * 1024))
+
+            # 验证下载传递的是 fast_download_connections (7)
+            with patch("core.media_transfer.fast_download_file", new_callable=AsyncMock) as mock_dl:
+                mock_dl.return_value = out_file
+                await helper_split.download_media_to_path(mock_msg, tmpdir)
+                mock_dl.assert_awaited_once_with(
+                    client=mock_ub,
+                    location=mock_msg,
+                    out_file_path=os.path.join(tmpdir, "100.mp4"),
+                    file_size=15 * 1024 * 1024,
+                    connection_count=7,
+                )
+
+            # 验证上传传递的是 fast_upload_connections (3)
+            with patch("core.media_transfer.fast_upload_file", new_callable=AsyncMock) as mock_up:
+                mock_up.return_value = types.InputFileBig(id=1, parts=30, name="split_test.mp4")
+                await helper_split.send_file_with_compat(-100123, out_file)
+                mock_up.assert_awaited_once_with(
+                    client=mock_bot,
+                    file_path=out_file,
+                    connection_count=3,
+                )
+
+        # 2. 缺省配置场景：未单独配置时，均回退到 fast_transfer_connections
+        helper_fallback = MediaTransferHelper(
+            bot=mock_bot,
+            userbot=mock_ub,
+            upload_part_size_kb=512,
+            download_part_size_kb=512,
+            enable_fast_transfer=True,
+            fast_transfer_connections=5,
+            fast_transfer_min_size_mb=10,
+        )
+        self.assertEqual(helper_fallback.fast_download_connections, 5)
+        self.assertEqual(helper_fallback.fast_upload_connections, 5)
+
 
 if __name__ == "__main__":
     unittest.main()

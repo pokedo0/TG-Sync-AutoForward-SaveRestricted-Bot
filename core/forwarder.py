@@ -41,6 +41,12 @@ class Forwarder:
         )
         self.enable_fast_transfer = bool(transfer_cfg.get("enable_fast_transfer", True))
         self.fast_transfer_connections = int(transfer_cfg.get("fast_transfer_connections", 4))
+        self.fast_download_connections = transfer_cfg.get("fast_download_connections")
+        if self.fast_download_connections is not None:
+            self.fast_download_connections = int(self.fast_download_connections)
+        self.fast_upload_connections = transfer_cfg.get("fast_upload_connections")
+        if self.fast_upload_connections is not None:
+            self.fast_upload_connections = int(self.fast_upload_connections)
         self.fast_transfer_min_size_mb = int(transfer_cfg.get("fast_transfer_min_size_mb", 10))
         self.media = MediaTransferHelper(
             bot=self.bot,
@@ -50,6 +56,8 @@ class Forwarder:
             enable_fast_transfer=self.enable_fast_transfer,
             fast_transfer_connections=self.fast_transfer_connections,
             fast_transfer_min_size_mb=self.fast_transfer_min_size_mb,
+            fast_download_connections=self.fast_download_connections,
+            fast_upload_connections=self.fast_upload_connections,
         )
 
     @staticmethod

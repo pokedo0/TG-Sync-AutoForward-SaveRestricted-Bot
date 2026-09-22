@@ -29,7 +29,9 @@ rate_limit:
 # 传输性能调优（下载+上传链路）
 transfer:
   enable_fast_transfer: true # 是否启用 FastTelethon 多连接并发传输加速
-  fast_transfer_connections: 4 # 并发连接数（推荐 4，范围 2-8，切勿超过 8 防风控）
+  fast_download_connections: 6 # 下载并发连接数（推荐 4-8，UserBot 拉流）
+  fast_upload_connections: 4 # 上传并发连接数（推荐 3-4，Bot 传输）
+  fast_transfer_connections: 4 # 兼容兜底并发连接数（未单独指定时生效）
   fast_transfer_min_size_mb: 10 # 启用多连接的最小文件体积（低于此值走原生传输）
   album_download_concurrency: 3 # 相册并发下载数（建议 2-4）
   upload_part_size_kb: 512 # 上传分片大小，范围 32-512
