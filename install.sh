@@ -48,6 +48,13 @@ else
     echo "⚠️ 找不到 requirements.txt，跳过安装依赖。"
 fi
 
+echo "🔍 检查加速模块 (cryptg)..."
+if python3 -c "import cryptg" &> /dev/null; then
+    echo "✅ cryptg 加速模块已成功加载 (C/Rust AES)"
+else
+    echo "⚠️ 未检测到 cryptg，当前使用低速 pure-python pyaes。若安装失败请确认是否安装: build-essential python3-dev"
+fi
+
 echo "⚙️ 正在生成 Systemd 服务文件: ${SERVICE_FILE}"
 cat > "${SERVICE_FILE}" << EOF
 [Unit]

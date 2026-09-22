@@ -84,6 +84,13 @@ async def _setup_bot(bot: TelegramClient, userbot_manager: UserBotManager,
 async def main():
     config = load_config()
 
+    # 检查 cryptg 加速模块
+    try:
+        import cryptg
+        logger.info("cryptg 加速模块已加载 (C/Rust AES)")
+    except ImportError:
+        logger.warning("未检测到 cryptg，当前使用低速 pure-python pyaes，大文件下载/上传速度可能受限")
+
     # 确保所需目录存在
     os.makedirs("data", exist_ok=True)
     os.makedirs("sessions", exist_ok=True)
