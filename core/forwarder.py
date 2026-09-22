@@ -39,11 +39,17 @@ class Forwarder:
         self.download_part_size_kb = self._clamp_part_size_kb(
             transfer_cfg.get("download_part_size_kb", 512)
         )
+        self.enable_fast_transfer = bool(transfer_cfg.get("enable_fast_transfer", True))
+        self.fast_transfer_connections = int(transfer_cfg.get("fast_transfer_connections", 4))
+        self.fast_transfer_min_size_mb = int(transfer_cfg.get("fast_transfer_min_size_mb", 10))
         self.media = MediaTransferHelper(
             bot=self.bot,
             userbot=self.userbot,
             upload_part_size_kb=self.upload_part_size_kb,
             download_part_size_kb=self.download_part_size_kb,
+            enable_fast_transfer=self.enable_fast_transfer,
+            fast_transfer_connections=self.fast_transfer_connections,
+            fast_transfer_min_size_mb=self.fast_transfer_min_size_mb,
         )
 
     @staticmethod
@@ -572,14 +578,24 @@ class Forwarder:
 
             with tempfile.TemporaryDirectory() as tmpdir:
                 ok_items = await self._download_album_media(media_msgs, tmpdir, userbot=ub)
-                files, captions = self._build_album_upload_payload(ok_items)
-                if not files:
+                if not ok_items:
                     logger.warning("策略3相册: 媒体下载失败")
                     return []
+
+                ordered_items = sorted(ok_items, key=lambda item: item[0])
+                captions = [m.text or "" for _, m, _, _ in ordered_items]
+
+                files = []
+                for _, message, path, thumb_path in ordered_items:
+                    item = await self.media.prepare_album_media_item(
+                        message, path, thumb_path=thumb_path
+                    )
+                    files.append(item)
+
                 has_video = any(self.media.is_video_message(m) for m in media_msgs)
                 logger.info("策略3相册上传: 待发 %d 个文件, has_video=%s supports_streaming=%s",
                             len(files), has_video, has_video)
-                result = await self.bot.send_file(
+                result = await self.media.send_file_with_compat(
                     target_chat_id,
                     files,
                     caption=captions,
@@ -636,9 +652,25 @@ class Forwarder:
         sem = asyncio.Semaphore(self.album_download_concurrency)
 
         async def _download_one(index: int, message: Message):
-            async with sem:
+            file_size = self.media.get_message_file_size(message) or 0
+            is_large = (
+                self.media.enable_fast_transfer
+                and file_size >= self.media.fast_transfer_min_size_mb * 1024 * 1024
+            )
+            if is_large:
+                # 大文件由 MediaTransferHelper 的 _large_download_lock 严格互斥，独占并发连接
                 path = await self.media.download_media_to_path(message, tmpdir, userbot=userbot)
-                return index, message, path
+            else:
+                # 小文件（如图片）通过 sem 保持并发轻量单连接下载
+                async with sem:
+                    path = await self.media.download_media_to_path(message, tmpdir, userbot=userbot)
+
+            thumb_path = None
+            if path and self.media.is_video_message(message):
+                thumb_path = await self.media.download_video_thumb_to_path(
+                    message, tmpdir, userbot=userbot
+                )
+            return index, message, path, thumb_path
 
         tasks = [
             asyncio.create_task(_download_one(idx, m))
@@ -646,23 +678,23 @@ class Forwarder:
         ]
         downloaded = await asyncio.gather(*tasks, return_exceptions=True)
 
-        ok_items: list[tuple[int, Message, str]] = []
+        ok_items: list[tuple[int, Message, str, str | None]] = []
         for item in downloaded:
             if isinstance(item, Exception):
                 logger.warning("策略3相册: 并发下载异常: %s", item)
                 continue
-            index, message, path = item
+            index, message, path, thumb_path = item
             if path:
-                ok_items.append((index, message, path))
+                ok_items.append((index, message, path, thumb_path))
         return ok_items
 
     @staticmethod
     def _build_album_upload_payload(
-        ok_items: list[tuple[int, Message, str]]
+        ok_items: list[tuple],
     ) -> tuple[list[str], list[str]]:
         ordered_items = sorted(ok_items, key=lambda item: item[0])
-        files = [path for _, _, path in ordered_items]
-        captions = [message.text or "" for _, message, _ in ordered_items]
+        files = [item[2] for item in ordered_items]
+        captions = [item[1].text or "" for item in ordered_items]
         return files, captions
 
     async def _copy_message(self, client: TelegramClient, msg: Message,

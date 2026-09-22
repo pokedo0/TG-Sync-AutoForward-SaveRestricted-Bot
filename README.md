@@ -33,13 +33,40 @@ Design principle: **UserBot reads, Bot writes** — UserBot only participates in
 
 ## Getting Started
 
+### 1. Installation & Configuration
+
 ```bash
 pip install -r requirements.txt
-cp config.example.yaml config.yaml   # Fill in your credentials
-python main.py
+cp config.example.yaml config.yaml   # Fill in api_id, api_hash, bot_token, and phone/phones
 ```
 
-> On first launch, UserBot phone verification is required. Session files are persisted in `sessions/`.
+### 2. UserBot Login & Session Initialization
+
+Before starting the bot, initialize UserBot sessions via the interactive login tool (supports multiple accounts):
+
+* **Using the auto-adaptive script (Recommended on Linux / VPS)**:
+  ```bash
+  bash scripts/login_userbot.sh -p +8613800138000
+  ```
+* **Using Python directly**:
+  ```bash
+  python scripts/login_userbot.py -p +8613800138000
+  ```
+* **Using Docker interactive run**:
+  ```bash
+  docker compose run --rm bot python scripts/login_userbot.py -p +8613800138000
+  ```
+
+> **Notes**:
+> 1. Follow the terminal prompt to enter the SMS verification code and 2FA password. Session files are persisted in `sessions/`.
+> 2. If configuring multiple UserBots (under `phones` in `config.yaml`), run the login command once for each phone number.
+> 3. `.session` files are cross-platform SQLite databases; you can also log in on a local machine and copy the generated files to the server's `sessions/` directory.
+
+### 3. Start the Bot
+
+```bash
+python main.py
+```
 
 ## Commands
 
@@ -80,6 +107,13 @@ The runtime always attempts strategies in order, falling back automatically on f
 ## Docker Deployment
 
 ```bash
+# 1. Copy and configure settings
+cp config.example.yaml config.yaml
+
+# 2. Interactively initialize UserBot session (Required on first run)
+docker compose run --rm bot python scripts/login_userbot.py -p +8613800138000
+
+# 3. Build and start the bot service in the background
 docker compose up -d --build
 ```
 

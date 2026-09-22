@@ -1,17 +1,31 @@
-"""媒体下载与上传兼容辅助。"""
+import asyncio
+import logging
 import os
 
 from telethon import TelegramClient
+from telethon.tl import types
 from telethon.tl.types import DocumentAttributeVideo, Message, MessageMediaDocument
+
+from core.fast_telethon import fast_download_file, fast_upload_file
+
+logger = logging.getLogger("tg_forward_bot.media_transfer")
 
 
 class MediaTransferHelper:
     def __init__(self, bot: TelegramClient, userbot: TelegramClient,
-                 upload_part_size_kb: int, download_part_size_kb: int):
+                 upload_part_size_kb: int, download_part_size_kb: int,
+                 enable_fast_transfer: bool = True,
+                 fast_transfer_connections: int = 4,
+                 fast_transfer_min_size_mb: int = 10):
         self.bot = bot
         self.userbot = userbot
         self.upload_part_size_kb = upload_part_size_kb
         self.download_part_size_kb = download_part_size_kb
+        self.enable_fast_transfer = enable_fast_transfer
+        self.fast_transfer_connections = max(2, min(8, int(fast_transfer_connections)))
+        self.fast_transfer_min_size_mb = max(1, int(fast_transfer_min_size_mb))
+        self._large_download_lock = asyncio.Lock()
+        self._large_upload_lock = asyncio.Lock()
 
     @staticmethod
     def is_video_message(msg: Message) -> bool:
@@ -120,9 +134,53 @@ class MediaTransferHelper:
             ext = ".mp4" if self.is_video_message(msg) else ".bin"
         return os.path.join(tmpdir, f"{msg.id}{ext}")
 
+    @staticmethod
+    def get_message_file_size(msg: Message) -> int | None:
+        file_obj = getattr(msg, "file", None)
+        if file_obj and getattr(file_obj, "size", None):
+            return file_obj.size
+        media = getattr(msg, "media", None)
+        if isinstance(media, MessageMediaDocument):
+            doc = getattr(media, "document", None)
+            if doc and getattr(doc, "size", None):
+                return doc.size
+        return None
+
     async def download_media_to_path(self, msg: Message, tmpdir: str,
                                      userbot: TelegramClient | None = None) -> str | None:
         path = self.build_download_target_path(msg, tmpdir)
+        ub = userbot or self.userbot
+
+        if self.enable_fast_transfer and ub:
+            file_size = self.get_message_file_size(msg)
+            min_bytes = self.fast_transfer_min_size_mb * 1024 * 1024
+            if file_size and file_size >= min_bytes:
+                async with self._large_download_lock:
+                    try:
+                        logger.info(
+                            "[MediaTransfer] 尝试 FastTelethon 并发下载: msg_id=%s, 大小=%.2f MB (独占 %d 连接)",
+                            msg.id, file_size / (1024 * 1024), self.fast_transfer_connections,
+                        )
+                        res_path = await fast_download_file(
+                            client=ub,
+                            location=msg,
+                            out_file_path=path,
+                            file_size=file_size,
+                            connection_count=self.fast_transfer_connections,
+                        )
+                        if res_path and os.path.exists(res_path) and os.path.getsize(res_path) > 0:
+                            return res_path
+                    except Exception as e:
+                        logger.warning(
+                            "[MediaTransfer] FastTelethon 并发下载失败，降级回原生下载: msg_id=%s, 错误: %s",
+                            msg.id, e,
+                        )
+                        if os.path.exists(path):
+                            try:
+                                os.remove(path)
+                            except OSError:
+                                pass
+
         return await self._download_media_with_compat(msg, file=path, userbot=userbot)
 
     async def download_video_thumb_to_path(self, msg: Message, tmpdir: str,
@@ -155,12 +213,129 @@ class MediaTransferHelper:
         except TypeError:
             return await ub.download_media(media, **kwargs)
 
-    async def send_file_with_compat(self, target_chat_id: int, file, **kwargs):
+    async def _fast_upload_if_needed(self, file_path):
+        """若单个文件满足并发上传条件则调用 fast_upload_file，否则返回原始输入。"""
+        if (
+            self.enable_fast_transfer
+            and isinstance(file_path, str)
+            and os.path.isfile(file_path)
+            and not isinstance(file_path, (types.InputFile, types.InputFileBig))
+        ):
+            try:
+                file_size = os.path.getsize(file_path)
+                min_bytes = self.fast_transfer_min_size_mb * 1024 * 1024
+                if file_size >= min_bytes:
+                    async with self._large_upload_lock:
+                        logger.info(
+                            "[MediaTransfer] 尝试 FastTelethon 并发上传: 文件=%s, 大小=%.2f MB (独占 %d 连接)",
+                            os.path.basename(file_path), file_size / (1024 * 1024), self.fast_transfer_connections,
+                        )
+                        input_file = await fast_upload_file(
+                            client=self.bot,
+                            file_path=file_path,
+                            connection_count=self.fast_transfer_connections,
+                        )
+                        if input_file:
+                            return input_file
+            except Exception as e:
+                logger.warning(
+                    "[MediaTransfer] FastTelethon 并发上传失败，降级回原生发送: 文件=%s, 错误: %s",
+                    os.path.basename(file_path), e,
+                )
+        return file_path
+
+    async def prepare_album_media_item(
+        self,
+        msg: Message,
+        path: str,
+        thumb_path: str | None = None,
+    ):
+        """预处理相册项：
+        - 视频文件：上传缩略图并包装为带完整属性和封面的 InputMediaUploadedDocument，
+          同时复用 FastTelethon 进行大文件并发上传。
+        - 其他文件：按大小判定是否进行 FastTelethon 并发上传。
+        """
+        if not self.is_video_message(msg):
+            return await self._fast_upload_if_needed(path)
+
         try:
-            return await self.bot.send_file(target_chat_id, file, **kwargs)
+            # 1. 上传视频本体（大文件并发加速，小文件原生上传）
+            file_handle = await self._fast_upload_if_needed(path)
+            if not isinstance(file_handle, (types.InputFile, types.InputFileBig)):
+                file_handle = await self.bot.upload_file(path)
+
+            # 2. 上传缩略图封面（若存在）
+            thumb_handle = None
+            if thumb_path and os.path.isfile(thumb_path):
+                try:
+                    thumb_handle = await self.bot.upload_file(thumb_path)
+                except Exception as e:
+                    logger.warning("[MediaTransfer] 上传相册视频封面失败: msg=%s err=%s", msg.id, e)
+
+            # 3. 提取并保留原始视频属性（宽高、时长、流式播放等）
+            self.ensure_video_streaming(msg)
+            raw_attrs = self.get_document_attributes(msg)
+            attrs = list(raw_attrs) if raw_attrs else []
+
+            has_video_attr = any(isinstance(a, DocumentAttributeVideo) for a in attrs)
+            if not has_video_attr:
+                attrs.append(DocumentAttributeVideo(duration=0, w=0, h=0, supports_streaming=True))
+            else:
+                for a in attrs:
+                    if isinstance(a, DocumentAttributeVideo):
+                        a.supports_streaming = True
+
+            has_fn_attr = any(isinstance(a, types.DocumentAttributeFilename) for a in attrs)
+            if not has_fn_attr:
+                attrs.append(types.DocumentAttributeFilename(file_name=os.path.basename(path)))
+
+            mime_type = "video/mp4"
+            media = getattr(msg, "media", None)
+            if isinstance(media, MessageMediaDocument):
+                doc = getattr(media, "document", None)
+                if doc and getattr(doc, "mime_type", None):
+                    mime_type = doc.mime_type
+
+            logger.info(
+                "[MediaTransfer] 相册视频成功组装封面与属性: msg_id=%s, 文件=%s, 携带封面=%s",
+                msg.id, os.path.basename(path), bool(thumb_handle),
+            )
+
+            return types.InputMediaUploadedDocument(
+                file=file_handle,
+                mime_type=mime_type,
+                attributes=attrs,
+                thumb=thumb_handle,
+            )
+        except Exception as e:
+            logger.warning(
+                "[MediaTransfer] 组装相册视频封面/属性异常，降级发送裸文件: msg_id=%s, err=%s",
+                msg.id, e,
+            )
+            return await self._fast_upload_if_needed(path)
+
+    async def send_file_with_compat(self, target_chat_id: int, file, **kwargs):
+        if isinstance(file, (list, tuple)):
+            file_to_send = []
+            accelerated_count = 0
+            for f in file:
+                prepared = await self._fast_upload_if_needed(f)
+                if isinstance(prepared, (types.InputFile, types.InputFileBig)):
+                    accelerated_count += 1
+                file_to_send.append(prepared)
+            if accelerated_count > 0:
+                logger.info(
+                    "[MediaTransfer] 相册文件上传预处理完成: 总数=%d, FastTelethon并发加速数=%d",
+                    len(file), accelerated_count,
+                )
+        else:
+            file_to_send = await self._fast_upload_if_needed(file)
+
+        try:
+            return await self.bot.send_file(target_chat_id, file_to_send, **kwargs)
         except TypeError:
             if "video_timestamp" not in kwargs:
                 raise
             fallback = dict(kwargs)
             fallback.pop("video_timestamp", None)
-            return await self.bot.send_file(target_chat_id, file, **fallback)
+            return await self.bot.send_file(target_chat_id, file_to_send, **fallback)

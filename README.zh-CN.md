@@ -33,13 +33,40 @@
 
 ## 快速开始
 
+### 1. 安装与配置
+
 ```bash
 pip install -r requirements.txt
-cp config.example.yaml config.yaml   # 编辑填入你的配置
-python main.py
+cp config.example.yaml config.yaml   # 编辑填入你的配置 (api_id, api_hash, bot_token 及 phone/phones)
 ```
 
-> 首次启动需要 UserBot 验证码登录，会话文件保存在 `sessions/` 目录。
+### 2. UserBot 交互式登录与会话初始化
+
+首次启动前，需通过交互脚本完成 UserBot 登录（支持多账号，按顺序依次登录）：
+
+* **自适应脚本（推荐，Linux / VPS）**：
+  ```bash
+  bash scripts/login_userbot.sh -p +8613800138000
+  ```
+* **Python 直接运行**：
+  ```bash
+  python scripts/login_userbot.py -p +8613800138000
+  ```
+* **Docker 交互运行**：
+  ```bash
+  docker compose run --rm bot python scripts/login_userbot.py -p +8613800138000
+  ```
+
+> **说明**：
+> 1. 终端提示输入短信验证码及 2FA 密码后，会话凭证将持久化在 `sessions/` 目录。
+> 2. 若配置了多个 UserBot（在 `config.yaml` 的 `phones` 列表中），请针对每个号码分别运行一次登录。
+> 3. `.session` 文件跨平台通用，亦可在本地电脑登录生成后直接复制到服务器 `sessions/` 目录。
+
+### 3. 启动主服务
+
+```bash
+python main.py
+```
 
 ## 命令
 
@@ -80,6 +107,13 @@ python main.py
 ## Docker 部署
 
 ```bash
+# 1. 复制并编辑配置文件
+cp config.example.yaml config.yaml
+
+# 2. 交互式初始化 UserBot 登录（首次必做）
+docker compose run --rm bot python scripts/login_userbot.py -p +8613800138000
+
+# 3. 后台构建并启动主服务
 docker compose up -d --build
 ```
 
