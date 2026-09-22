@@ -27,8 +27,8 @@ logger = logging.getLogger("tg_forward_bot.restricted_syncer")
 
 class RestrictedSyncer(SyncComponentBase):
     def __init__(self, bot: TelegramClient, userbot: TelegramClient,
-                 db: Database, config: dict):
-        super().__init__(bot, userbot, db, config)
+                 db: Database, config: dict, userbot_manager=None):
+        super().__init__(bot, userbot, db, config, userbot_manager=userbot_manager)
 
     # ------------------------------------------------------------------
     # Takeout 转发核心
@@ -130,23 +130,25 @@ class RestrictedSyncer(SyncComponentBase):
         source_chat_id: int,
         source_topic_id: int | None,
         notify: Callable[[str], Awaitable[None]],
+        userbot: TelegramClient | None = None,
     ) -> tuple[list[int], int] | tuple[None, int]:
         """扫描源的全部历史消息，收集被判定为受限的消息 ID 列表。
 
         返回 (restricted_ids, total_scanned)。失败时 restricted_ids 为 None。
         """
+        ub = userbot or self.userbot
         restricted_ids: list[int] = []
         total_scanned = 0
         chat_globally_restricted = False
 
         try:
             try:
-                entity = await self.userbot.get_entity(source_chat_id)
+                entity = await ub.get_entity(source_chat_id)
                 chat_globally_restricted = is_chat_globally_restricted(entity)
             except Exception:
                 chat_globally_restricted = False
 
-            async for msg in self.userbot.iter_messages(
+            async for msg in ub.iter_messages(
                 source_chat_id,
                 reverse=True,
                 reply_to=source_topic_id,
@@ -264,22 +266,25 @@ class RestrictedSyncer(SyncComponentBase):
         notify_chat_id: int | None = None,
         notify_topic_id: int | None = None,
         notify_reply_to_msg_id: int | None = None,
+        userbot: TelegramClient | None = None,
     ):
         """执行受限消息同步任务。"""
         self._cancel_flags[task_id] = False
+        active_userbot = await self.get_active_userbot(source_chat_id, userbot)
+        phone = getattr(active_userbot, "_phone", "default")
 
         async def _notify(text: str) -> None:
             await self._notify(notify_chat_id, notify_topic_id, notify_reply_to_msg_id, text)
 
         logger.info(
-            "受限同步任务 #%s 开始: source=%s topic=%s",
-            task_id, source_chat_id, source_topic_id,
+            "受限同步任务 #%s 开始: source=%s topic=%s (UserBot: %s)",
+            task_id, source_chat_id, source_topic_id, phone
         )
 
         # 阶段 1: 扫描收集受限消息 ID
         await _notify("🔍 正在扫描源消息，识别受限内容...")
         restricted_ids, total_scanned = await self._collect_restricted_ids(
-            task_id, source_chat_id, source_topic_id, _notify
+            task_id, source_chat_id, source_topic_id, _notify, userbot=active_userbot
         )
 
         if restricted_ids is None:
@@ -311,7 +316,7 @@ class RestrictedSyncer(SyncComponentBase):
         total_fail = 0
 
         try:
-            async with self.userbot.takeout() as takeout:
+            async with active_userbot.takeout() as takeout:
                 for i in range(0, total, batch_size):
                     if self._cancel_flags.get(task_id):
                         await models.update_task_status(self.db, task_id, "paused")

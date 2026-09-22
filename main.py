@@ -10,6 +10,7 @@ from telethon.tl.types import BotCommand, BotCommandScopeDefault
 from db.database import Database
 from bot.handlers import register_handlers
 from core.monitor import MonitorManager
+from core.userbot_manager import UserBotManager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,22 +32,16 @@ def load_config(path: str = "config.yaml") -> dict:
         return yaml.safe_load(f)
 
 
-async def _start_clients(bot: TelegramClient, userbot: TelegramClient,
+async def _start_clients(bot: TelegramClient, userbot_manager: UserBotManager,
                          config: dict) -> None:
-    """启动 Bot 和 UserBot 客户端。"""
+    """启动 Bot 和所有 UserBot 客户端。"""
     await bot.start(bot_token=config["bot_token"])
     logger.info("Bot 客户端已启动")
 
-    phone = config.get("phone")
-    if not phone:
-        logger.error("config.yaml 中未配置 phone")
-        sys.exit(1)
-    await userbot.start(phone=phone)
-    me = await userbot.get_me()
-    logger.info("UserBot 已登录: %s (ID: %s)", me.first_name, me.id)
+    await userbot_manager.start()
 
 
-async def _setup_bot(bot: TelegramClient, userbot: TelegramClient,
+async def _setup_bot(bot: TelegramClient, userbot_manager: UserBotManager,
                      db: Database, config: dict) -> MonitorManager:
     """注册命令菜单、处理器，恢复任务。返回 MonitorManager 实例。"""
     # 设置 Bot 命令菜单（覆盖旧命令）
@@ -66,8 +61,9 @@ async def _setup_bot(bot: TelegramClient, userbot: TelegramClient,
     logger.info("Bot 命令菜单已更新")
 
     # 注册 Bot 命令处理器
-    monitor_manager = MonitorManager(bot, userbot, db, config)
-    register_handlers(bot, userbot, db, config, monitor_manager)
+    primary_ub = userbot_manager.primary_userbot
+    monitor_manager = MonitorManager(bot, primary_ub, db, config, userbot_manager=userbot_manager)
+    register_handlers(bot, primary_ub, db, config, monitor_manager, userbot_manager=userbot_manager)
     logger.info("命令处理器已注册")
 
     # 恢复之前运行中的 monitor 任务；将孤立的 sync 任务自动暂停
@@ -97,19 +93,18 @@ async def main():
     await db.init()
     logger.info("数据库初始化完成")
 
-    # 初始化双客户端（增大内置重试参数以覆盖短暂网络波动）
+    # 初始化 Bot 客户端
     bot = TelegramClient(
         "sessions/bot", config["api_id"], config["api_hash"],
         connection_retries=10, retry_delay=5, timeout=30,
     )
-    userbot = TelegramClient(
-        "sessions/userbot", config["api_id"], config["api_hash"],
-        connection_retries=10, retry_delay=5, timeout=30,
-    )
+
+    # 初始化多 UserBot 管理器
+    userbot_manager = UserBotManager(config)
 
     # === 首次启动 ===
-    await _start_clients(bot, userbot, config)
-    await _setup_bot(bot, userbot, db, config)
+    await _start_clients(bot, userbot_manager, config)
+    await _setup_bot(bot, userbot_manager, db, config)
 
     # === 运行 + 断线重连循环 ===
     reconnect_count = 0
@@ -143,7 +138,7 @@ async def main():
 
         try:
             await bot.connect()
-            await userbot.connect()
+            await userbot_manager.connect_all()
             reconnect_count = 0   # 重连成功，重置计数
             logger.info("重连成功")
         except Exception as e:

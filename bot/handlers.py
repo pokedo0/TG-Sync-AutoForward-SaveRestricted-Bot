@@ -30,6 +30,7 @@ from core.syncer import Syncer
 from core.restricted_syncer import RestrictedSyncer
 from core.monitor import MonitorManager
 from core.rate_limiter import _get_dynamic_rate_limit
+from core.userbot_manager import UserBotManager
 from db.database import Database
 from db import models
 
@@ -37,11 +38,12 @@ logger = logging.getLogger("tg_forward_bot.handlers")
 
 def register_handlers(bot: TelegramClient, userbot: TelegramClient,
                       db: Database, config: dict,
-                      monitor_manager: MonitorManager):
+                      monitor_manager: MonitorManager,
+                      userbot_manager: UserBotManager | None = None):
     admin_ids = set(config.get("admin_ids", []))
     allow_public = config.get("allow_public_resolve", False)
-    syncer = Syncer(bot, userbot, db, config)
-    restricted_syncer = RestrictedSyncer(bot, userbot, db, config)
+    syncer = Syncer(bot, userbot, db, config, userbot_manager=userbot_manager)
+    restricted_syncer = RestrictedSyncer(bot, userbot, db, config, userbot_manager=userbot_manager)
     forwarder = monitor_manager.forwarder
     _sync_tasks: dict[int, asyncio.Task] = {}
 
@@ -160,9 +162,12 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
 
         return "未知线程"
 
-    async def _describe_source_for_display(source_id: int, parsed: ParsedLink) -> str:
+    async def _describe_source_for_display(
+        source_id: int, parsed: ParsedLink, client: TelegramClient | None = None
+    ) -> str:
         """构造源描述，确保话题展示优先使用真实名称。"""
-        source_desc = await describe_source(userbot, source_id, parsed)
+        ub = client or userbot
+        source_desc = await describe_source(ub, source_id, parsed)
         if not parsed.topic_id:
             return source_desc
         topic_name = await _resolve_topic_display_name(source_id, parsed.topic_id)
@@ -228,10 +233,16 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
 
     async def _ensure_userbot_joined_source_for_monitor(
         source_chat_id: int, source_topic_id: int | None
-    ) -> tuple[bool, str | None]:
-        """校验 monitor 前提: userbot 已加入源。"""
+    ) -> tuple[bool, str | None, TelegramClient | None]:
+        """校验 monitor 前提: userbot 已加入源。返回 (ok, reason, active_userbot)。"""
+        active_ub = None
+        if userbot_manager:
+            active_ub, _ = await userbot_manager.resolve_accessible_userbot(source_chat_id)
+        if not active_ub:
+            active_ub = userbot
+
         try:
-            entity = await userbot.get_entity(source_chat_id)
+            entity = await active_ub.get_entity(source_chat_id)
         except (ValueError, errors.ChannelPrivateError):
             source_text = await _format_chat_topic_display(
                 source_chat_id, source_topic_id
@@ -241,6 +252,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
                 "❌ /monitor 要求 UserBot 必须先加入源后才会生效。\n"
                 f"📌 源: {source_text}\n"
                 "请先让 UserBot 加入该源，再执行 /monitor。",
+                None,
             )
         except Exception as e:
             logger.warning("校验 userbot 源加入状态失败 source=%s err=%s", source_chat_id, e)
@@ -251,16 +263,17 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
                 False,
                 "❌ 无法确认 UserBot 对源的可访问性，请先确保 UserBot 已加入源。\n"
                 f"📌 源: {source_text}",
+                None,
             )
 
         # Channel/超级群走参与者校验；其它会话默认放行。
         if not isinstance(entity, types.Channel):
-            return True, None
+            return True, None, active_ub
 
         try:
-            me = await userbot.get_me()
-            await userbot(GetParticipantRequest(channel=entity, participant=me.id))
-            return True, None
+            me = await active_ub.get_me()
+            await active_ub(GetParticipantRequest(channel=entity, participant=me.id))
+            return True, None, active_ub
         except errors.UserNotParticipantError:
             source_text = await _format_chat_topic_display(
                 source_chat_id, source_topic_id
@@ -270,6 +283,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
                 "❌ /monitor 未生效：UserBot 尚未加入源。\n"
                 f"📌 源: {source_text}\n"
                 "请先让 UserBot 加入该频道/群组后，再执行 /monitor。",
+                None,
             )
         except errors.ChannelPrivateError:
             source_text = await _format_chat_topic_display(
@@ -280,13 +294,14 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
                 "❌ /monitor 未生效：源为私有且 UserBot 无访问权限。\n"
                 f"📌 源: {source_text}\n"
                 "请先让 UserBot 加入该源后重试。",
+                None,
             )
         except Exception as e:
             logger.warning("GetParticipant 校验失败 source=%s err=%s", source_chat_id, e)
             # 某些场景参与者列表受限，回退到读取探测。
             try:
-                await userbot.get_messages(source_chat_id, limit=1)
-                return True, None
+                await active_ub.get_messages(source_chat_id, limit=1)
+                return True, None, active_ub
             except Exception:
                 source_text = await _format_chat_topic_display(
                     source_chat_id, source_topic_id
@@ -296,6 +311,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
                     "❌ /monitor 要求 UserBot 可读取源消息，但当前不可读。\n"
                     f"📌 源: {source_text}\n"
                     "请先让 UserBot 加入该源后重试。",
+                    None,
                 )
 
     async def _stop_running_task(task: dict):
@@ -325,12 +341,14 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         return buttons
 
     async def _resolve_private_fetch_target(parsed: ParsedLink,
-                                            source_id: int) -> FetchTarget | None:
+                                            source_id: int,
+                                            client: TelegramClient | None = None) -> FetchTarget | None:
         """将私聊解析的 parsed link 解析为真实抓取 chat/msg。"""
         fetch_chat_id = source_id
         target_msg_id = parsed.msg_id
+        ub = client or userbot
         if parsed.comment_id:
-            linked_id = await resolve_linked_chat(userbot, source_id)
+            linked_id = await resolve_linked_chat(ub, source_id)
             if not linked_id:
                 return None
             fetch_chat_id = linked_id
@@ -387,19 +405,21 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
                 logger.debug("Bot 预热讨论群 peer 失败 %s: %s", fetch_chat_id, e)
 
     async def _forward_private_message(event, fetch_chat_id: int, msg,
-                                       parsed: ParsedLink):
+                                       parsed: ParsedLink,
+                                       client: TelegramClient | None = None):
         """私聊链接解析后的统一转发逻辑。"""
+        ub = client or userbot
         reply_to_id = event.message.id
         kind = classify_message_kind(msg, single=parsed.single)
         if kind == "album":
             album_msgs = await collect_album_messages(
-                userbot, fetch_chat_id, msg, window=10)
+                ub, fetch_chat_id, msg, window=10)
             logger.info("媒体集合: %d 条, grouped_id=%s",
                         len(album_msgs), msg.grouped_id)
             source_ids = [m.id for m in album_msgs]
             target_ids = await forwarder.forward_album(
                 fetch_chat_id, source_ids, event.chat_id, mode="copy",
-                target_topic_id=reply_to_id, caller="private")
+                target_topic_id=reply_to_id, caller="private", userbot=ub)
             if not target_ids:
                 await event.reply("❌ 转发失败，已尝试所有策略")
             return
@@ -411,7 +431,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
                 logger.info("纯文本消息")
             target_id = await forwarder.forward_message(
                 fetch_chat_id, msg.id, event.chat_id, mode="copy",
-                target_topic_id=reply_to_id, caller="private")
+                target_topic_id=reply_to_id, caller="private", userbot=ub)
             if not target_id:
                 await event.reply("❌ 转发失败，已尝试所有策略")
             return
@@ -437,9 +457,11 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
 
         return parsed, source_id
 
-    async def _fetch_private_target_message(event, fetch_target: FetchTarget):
+    async def _fetch_private_target_message(event, fetch_target: FetchTarget,
+                                            client: TelegramClient | None = None):
+        ub = client or userbot
         try:
-            msg = await userbot.get_messages(fetch_target.chat_id, ids=fetch_target.msg_id)
+            msg = await ub.get_messages(fetch_target.chat_id, ids=fetch_target.msg_id)
             if not msg:
                 await event.reply("❌ 消息不存在")
                 return None
@@ -503,8 +525,17 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
 
         target_chat_id = event.chat_id
         target_topic_id = get_target_topic_id(event)
-        logger.info("创建同步任务: source=%s topic=%s -> target=%s target_topic=%s mode=%s",
-                     source_id, parsed.topic_id, target_chat_id, target_topic_id, mode)
+
+        active_ub = None
+        if userbot_manager:
+            active_ub, err_msg = await userbot_manager.resolve_accessible_userbot(source_id)
+            if not active_ub and parsed.is_private:
+                await event.reply(f"❌ {err_msg or '所有配置的 UserBot 均未加入该私有频道/群组'}")
+                return
+
+        logger.info("创建同步任务: source=%s topic=%s -> target=%s target_topic=%s mode=%s (UserBot: %s)",
+                     source_id, parsed.topic_id, target_chat_id, target_topic_id, mode,
+                     getattr(active_ub, '_phone', 'default'))
         task_id = await models.create_task(
             db, "sync", source_id, target_chat_id, mode,
             source_topic_id=parsed.topic_id,
@@ -529,7 +560,8 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             target_topic_id=target_topic_id,
             notify_chat_id=event.chat_id,
             notify_topic_id=target_topic_id,
-            notify_reply_to_msg_id=start_msg.id))
+            notify_reply_to_msg_id=start_msg.id,
+            userbot=active_ub))
         _sync_tasks[task_id] = task
 
     @bot.on(events.NewMessage(pattern=r"/syncrestrictedmsg(?:@\w+)?\s+"))
@@ -547,9 +579,17 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         target_chat_id = event.chat_id
         target_topic_id = get_target_topic_id(event)
 
+        active_ub = None
+        if userbot_manager:
+            active_ub, err_msg = await userbot_manager.resolve_accessible_userbot(source_id)
+            if not active_ub and parsed.is_private:
+                await event.reply(f"❌ {err_msg or '所有配置的 UserBot 均未加入该私有频道/群组'}")
+                return
+
         logger.info(
-            "创建受限同步任务: source=%s topic=%s -> target=%s target_topic=%s",
+            "创建受限同步任务: source=%s topic=%s -> target=%s target_topic=%s (UserBot: %s)",
             source_id, parsed.topic_id, target_chat_id, target_topic_id,
+            getattr(active_ub, '_phone', 'default')
         )
         task_id = await models.create_task(
             db, "sync_restricted", source_id, target_chat_id, "copy",
@@ -578,6 +618,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             notify_chat_id=event.chat_id,
             notify_topic_id=target_topic_id,
             notify_reply_to_msg_id=start_msg.id,
+            userbot=active_ub,
         ))
         _sync_tasks[task_id] = task
 
@@ -596,15 +637,16 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
 
         target_chat_id = event.chat_id
         target_topic_id = get_target_topic_id(event)
-        ok, reason = await _ensure_userbot_joined_source_for_monitor(
+        ok, reason, active_ub = await _ensure_userbot_joined_source_for_monitor(
             source_id, parsed.topic_id
         )
         if not ok:
             await event.reply(reason)
             return
 
-        logger.info("创建监控任务: source=%s topic=%s -> target=%s target_topic=%s mode=%s",
-                     source_id, parsed.topic_id, target_chat_id, target_topic_id, mode)
+        logger.info("创建监控任务: source=%s topic=%s -> target=%s target_topic=%s mode=%s (UserBot: %s)",
+                     source_id, parsed.topic_id, target_chat_id, target_topic_id, mode,
+                     getattr(active_ub, '_phone', 'default'))
         task_id = await models.create_task(
             db, "monitor", source_id, target_chat_id, mode,
             source_topic_id=parsed.topic_id,
@@ -613,7 +655,8 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         await monitor_manager.start_monitor(
             task_id, source_id, target_chat_id, mode,
             source_topic_id=parsed.topic_id,
-            target_topic_id=target_topic_id)
+            target_topic_id=target_topic_id,
+            userbot=active_ub)
 
         source_desc = await _format_chat_topic_display(source_id, parsed.topic_id)
         target_desc = await _format_chat_topic_display(
@@ -845,22 +888,33 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             return
         parsed, source_id = parsed_source
 
-        source_desc = await _describe_source_for_display(source_id, parsed)
-        comment_info = f" comment={parsed.comment_id}" if parsed.comment_id else ""
-        single_info = " [single]" if parsed.single else ""
-        logger.info("私聊解析: user=%s 源=%s msg=%s%s%s",
-                    event.sender_id, source_desc, parsed.msg_id,
-                    comment_info, single_info)
-
         fetch_target = await _resolve_private_fetch_target(parsed, source_id)
         if not fetch_target:
             await event.reply("❌ 无法获取频道的讨论群，评论消息无法解析")
             return
 
+        # 多 UserBot 按顺序探测与鉴权
+        active_ub = userbot
+        if userbot_manager:
+            active_ub, err_msg = await userbot_manager.resolve_accessible_userbot(
+                fetch_target.chat_id, fetch_target.msg_id
+            )
+            if not active_ub:
+                await event.reply(f"❌ {err_msg or '所有配置的 UserBot 均未加入该私有频道/群组，无法访问'}")
+                return
+
+        source_desc = await _describe_source_for_display(source_id, parsed, client=active_ub)
+        comment_info = f" comment={parsed.comment_id}" if parsed.comment_id else ""
+        single_info = " [single]" if parsed.single else ""
+        phone = getattr(active_ub, "_phone", "default")
+        logger.info("私聊解析: user=%s 源=%s msg=%s%s%s (UserBot: %s)",
+                    event.sender_id, source_desc, parsed.msg_id,
+                    comment_info, single_info, phone)
+
         # 预热 Bot 实体缓存，让策略1尽量命中
         await _pre_warm_bot_cache(parsed, source_id, fetch_target.chat_id)
 
-        msg = await _fetch_private_target_message(event, fetch_target)
+        msg = await _fetch_private_target_message(event, fetch_target, client=active_ub)
         if not msg:
             return
-        await _forward_private_message(event, fetch_target.chat_id, msg, parsed)
+        await _forward_private_message(event, fetch_target.chat_id, msg, parsed, client=active_ub)

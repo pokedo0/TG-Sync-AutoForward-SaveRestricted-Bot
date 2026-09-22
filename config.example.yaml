@@ -5,8 +5,13 @@ api_hash: "your_api_hash_here"
 # Bot Token（从 @BotFather 获取）
 bot_token: "your_bot_token_here"
 
-# UserBot 手机号（国际格式，如 +8613800138000）
-phone: "+8613800138000"
+# UserBot 手机号配置（国际格式，如 +8613800138000）
+# 支持单个手机号（兼容旧版）：
+# phone: "+8613800138000"
+# 或按优先级顺序配置多个 UserBot（遇到私有群时将按从上到下的顺序依次探测）：
+phones:
+  - "+8613800138000"
+  - "+852000000"
 
 # 管理员 Telegram User ID 列表
 admin_ids:

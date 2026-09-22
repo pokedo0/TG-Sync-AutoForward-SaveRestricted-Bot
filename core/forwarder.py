@@ -142,13 +142,15 @@ class Forwarder:
     async def forward_message(self, source_chat_id: int, msg_id: int,
                               target_chat_id: int, mode: str = "copy",
                               target_topic_id: int | None = None,
-                              caller: str = "monitor") -> int | None:
+                              caller: str = "monitor",
+                              userbot: TelegramClient | None = None) -> int | None:
         """
         转发单条消息，返回目标消息 ID。失败返回 None。
         降级链：Bot直接转发 → UserBot读+Bot写 → UserBot下载+Bot上传 → 发失败标记
         """
         result = await self._run_message_strategies(
-            source_chat_id, msg_id, target_chat_id, mode, target_topic_id, caller=caller
+            source_chat_id, msg_id, target_chat_id, mode, target_topic_id,
+            caller=caller, userbot=userbot
         )
         if result is not None:
             return result
@@ -161,18 +163,20 @@ class Forwarder:
 
         logger.warning("msg=%s 所有策略失败，发送 #fail2forward 标记", msg_id)
         return await self.send_fail_marker(
-            source_chat_id, msg_id, target_chat_id, target_topic_id
+            source_chat_id, msg_id, target_chat_id, target_topic_id, userbot=userbot
         )
 
     async def detect_restriction(
         self,
         source_chat_id: int,
         msg_id: int | None = None,
+        userbot: TelegramClient | None = None,
     ) -> tuple[bool, str]:
         """硬封禁并集：message.restriction_reason.platform=all 或 chat级全平台封禁。"""
+        ub = userbot or self.userbot
         chat_globally_restricted = False
         try:
-            entity = await self.userbot.get_entity(source_chat_id)
+            entity = await ub.get_entity(source_chat_id)
             chat_globally_restricted = is_chat_globally_restricted(entity)
         except Exception:
             chat_globally_restricted = False
@@ -185,7 +189,7 @@ class Forwarder:
             return False, ""
 
         try:
-            msg = await self._get_single_message(self.userbot, source_chat_id, msg_id)
+            msg = await self._get_single_message(ub, source_chat_id, msg_id)
             return detect_hard_restriction(chat_globally_restricted, msg)
         except Exception:
             pass
@@ -195,7 +199,8 @@ class Forwarder:
     async def forward_album(self, source_chat_id: int, msg_ids: list[int],
                             target_chat_id: int, mode: str = "copy",
                             target_topic_id: int | None = None,
-                            caller: str = "monitor") -> list[int]:
+                            caller: str = "monitor",
+                            userbot: TelegramClient | None = None) -> list[int]:
         """
         转发相册（grouped media），尽量保持为同一组发送。
         失败时降级为逐条转发。
@@ -205,7 +210,8 @@ class Forwarder:
 
         msg_ids = sorted(set(msg_ids))
         result = await self._run_album_strategies(
-            source_chat_id, msg_ids, target_chat_id, mode, target_topic_id, caller=caller
+            source_chat_id, msg_ids, target_chat_id, mode, target_topic_id,
+            caller=caller, userbot=userbot
         )
         if result:
             return result
@@ -213,7 +219,8 @@ class Forwarder:
         forwarded: list[int] = []
         for mid in msg_ids:
             target_mid = await self.forward_message(
-                source_chat_id, mid, target_chat_id, mode, target_topic_id, caller=caller)
+                source_chat_id, mid, target_chat_id, mode, target_topic_id,
+                caller=caller, userbot=userbot)
             if target_mid:
                 forwarded.append(target_mid)
         return forwarded
@@ -221,15 +228,16 @@ class Forwarder:
     async def _run_message_strategies(self, source_chat_id: int, msg_id: int,
                                       target_chat_id: int, mode: str,
                                       target_topic_id: int | None,
-                                      caller: str = "monitor") -> int | None:
+                                      caller: str = "monitor",
+                                      userbot: TelegramClient | None = None) -> int | None:
         await self.rl.wait()
         strategies = [
             ("策略1(Bot直接)", self._try_bot_direct,
              (source_chat_id, msg_id, target_chat_id, mode, target_topic_id, caller)),
             ("策略2(UserBot读+Bot写)", self._try_userbot_read_bot_forward,
-             (source_chat_id, msg_id, target_chat_id, mode, target_topic_id, caller)),
+             (source_chat_id, msg_id, target_chat_id, mode, target_topic_id, caller, userbot)),
             ("策略3(下载+上传)", self._try_userbot_download_bot_upload,
-             (source_chat_id, msg_id, target_chat_id, target_topic_id)),
+             (source_chat_id, msg_id, target_chat_id, target_topic_id, userbot)),
         ]
         for strategy_name, strategy_func, args in strategies:
             result = await strategy_func(*args)
@@ -241,15 +249,16 @@ class Forwarder:
     async def _run_album_strategies(self, source_chat_id: int, msg_ids: list[int],
                                     target_chat_id: int, mode: str,
                                     target_topic_id: int | None,
-                                    caller: str = "monitor") -> list[int]:
+                                    caller: str = "monitor",
+                                    userbot: TelegramClient | None = None) -> list[int]:
         await self.rl.wait()
         strategies = [
             ("策略1(Bot直接)", self._try_bot_direct_album,
              (source_chat_id, msg_ids, target_chat_id, mode, target_topic_id, caller)),
             ("策略2(UserBot读+Bot写)", self._try_userbot_read_bot_forward_album,
-             (source_chat_id, msg_ids, target_chat_id, mode, target_topic_id, caller)),
+             (source_chat_id, msg_ids, target_chat_id, mode, target_topic_id, caller, userbot)),
             ("策略3(下载+上传)", self._try_userbot_download_bot_upload_album,
-             (source_chat_id, msg_ids, target_chat_id, target_topic_id)),
+             (source_chat_id, msg_ids, target_chat_id, target_topic_id, userbot)),
         ]
         for strategy_name, strategy_func, args in strategies:
             result = await strategy_func(*args)
@@ -451,14 +460,16 @@ class Forwarder:
 
     async def _try_userbot_read_bot_forward(self, source_chat_id, msg_id,
                                             target_chat_id, mode, topic_id,
-                                            caller: str = "monitor") -> int | None:
+                                            caller: str = "monitor",
+                                            userbot: TelegramClient | None = None) -> int | None:
+        ub = userbot or self.userbot
         try:
-            msg = await self._get_single_message(self.userbot, source_chat_id, msg_id)
+            msg = await self._get_single_message(ub, source_chat_id, msg_id)
             if not msg:
                 logger.info("策略2: msg=%s UserBot 无法获取消息", msg_id)
                 return None
             if mode == "forward":
-                result = await self.userbot.forward_messages(
+                result = await ub.forward_messages(
                     target_chat_id, msg_id, source_chat_id)
             else:
                 result = await self._copy_message(
@@ -470,21 +481,23 @@ class Forwarder:
         except errors.FloodWaitError as e:
             return await self._handle_flood(e, self._try_userbot_read_bot_forward,
                                             source_chat_id, msg_id,
-                                            target_chat_id, mode, topic_id, caller)
+                                            target_chat_id, mode, topic_id, caller, ub)
         except Exception as e:
             logger.warning("策略2: msg=%s 异常: %s", msg_id, e)
             return None
 
     async def _try_userbot_read_bot_forward_album(self, source_chat_id, msg_ids,
                                                   target_chat_id, mode, topic_id,
-                                                  caller: str = "monitor") -> list[int]:
+                                                  caller: str = "monitor",
+                                                  userbot: TelegramClient | None = None) -> list[int]:
+        ub = userbot or self.userbot
         try:
-            msgs = await self._get_message_list(self.userbot, source_chat_id, msg_ids)
+            msgs = await self._get_message_list(ub, source_chat_id, msg_ids)
             if not msgs:
                 logger.info("策略2相册: UserBot 无法获取消息 %s", msg_ids)
                 return []
             if mode == "forward":
-                result = await self.userbot.forward_messages(
+                result = await ub.forward_messages(
                     target_chat_id, msg_ids, source_chat_id)
             else:
                 result = await self._copy_album(self.bot, msgs, target_chat_id, topic_id)
@@ -495,15 +508,17 @@ class Forwarder:
         except errors.FloodWaitError as e:
             return await self._handle_flood(
                 e, self._try_userbot_read_bot_forward_album,
-                source_chat_id, msg_ids, target_chat_id, mode, topic_id, caller)
+                source_chat_id, msg_ids, target_chat_id, mode, topic_id, caller, ub)
         except Exception as e:
             logger.warning("策略2相册: 异常: %s", e)
             return []
 
     async def _try_userbot_download_bot_upload(self, source_chat_id, msg_id,
-                                               target_chat_id, topic_id) -> int | None:
+                                               target_chat_id, topic_id,
+                                               userbot: TelegramClient | None = None) -> int | None:
+        ub = userbot or self.userbot
         try:
-            msg = await self._get_single_message(self.userbot, source_chat_id, msg_id)
+            msg = await self._get_single_message(ub, source_chat_id, msg_id)
             if not msg:
                 logger.info("策略3: msg=%s UserBot 无法获取消息", msg_id)
                 return None
@@ -512,9 +527,9 @@ class Forwarder:
 
             if is_file_media(msg):
                 with tempfile.TemporaryDirectory() as tmpdir:
-                    path = await self.media.download_media_to_path(msg, tmpdir)
+                    path = await self.media.download_media_to_path(msg, tmpdir, userbot=ub)
                     if path:
-                        thumb_path = await self.media.download_video_thumb_to_path(msg, tmpdir)
+                        thumb_path = await self.media.download_video_thumb_to_path(msg, tmpdir, userbot=ub)
                         send_kwargs = self.media.build_send_file_kwargs(
                             msg, reply_to, thumb_path=thumb_path
                         )
@@ -534,15 +549,17 @@ class Forwarder:
         except errors.FloodWaitError as e:
             return await self._handle_flood(e, self._try_userbot_download_bot_upload,
                                             source_chat_id, msg_id,
-                                            target_chat_id, topic_id)
+                                            target_chat_id, topic_id, ub)
         except Exception as e:
             logger.warning("策略3: msg=%s 异常: %s", msg_id, e)
             return None
 
     async def _try_userbot_download_bot_upload_album(self, source_chat_id, msg_ids,
-                                                     target_chat_id, topic_id) -> list[int]:
+                                                     target_chat_id, topic_id,
+                                                     userbot: TelegramClient | None = None) -> list[int]:
+        ub = userbot or self.userbot
         try:
-            msgs = await self._get_message_list(self.userbot, source_chat_id, msg_ids)
+            msgs = await self._get_message_list(ub, source_chat_id, msg_ids)
             if not msgs:
                 logger.info("策略3相册: UserBot 无法获取消息 %s", msg_ids)
                 return []
@@ -554,7 +571,7 @@ class Forwarder:
                 return []
 
             with tempfile.TemporaryDirectory() as tmpdir:
-                ok_items = await self._download_album_media(media_msgs, tmpdir)
+                ok_items = await self._download_album_media(media_msgs, tmpdir, userbot=ub)
                 files, captions = self._build_album_upload_payload(ok_items)
                 if not files:
                     logger.warning("策略3相册: 媒体下载失败")
@@ -574,17 +591,22 @@ class Forwarder:
         except errors.FloodWaitError as e:
             return await self._handle_flood(
                 e, self._try_userbot_download_bot_upload_album,
-                source_chat_id, msg_ids, target_chat_id, topic_id)
+                source_chat_id, msg_ids, target_chat_id, topic_id, ub)
         except Exception as e:
             logger.warning("策略3相册: 异常: %s", e)
             return []
 
-    async def build_source_link(self, source_chat_id: int, msg_id: int) -> str:
+    async def build_source_link(self, source_chat_id: int, msg_id: int,
+                                userbot: TelegramClient | None = None) -> str:
         """构造源消息链接（公开或私有）。"""
-        entity = await self.userbot.get_entity(source_chat_id)
-        username = getattr(entity, "username", None)
-        if username:
-            return f"https://t.me/{username}/{msg_id}"
+        ub = userbot or self.userbot
+        try:
+            entity = await ub.get_entity(source_chat_id)
+            username = getattr(entity, "username", None)
+            if username:
+                return f"https://t.me/{username}/{msg_id}"
+        except Exception:
+            pass
         chat_id = str(source_chat_id).replace("-100", "")
         return f"https://t.me/c/{chat_id}/{msg_id}"
 
@@ -595,9 +617,10 @@ class Forwarder:
         target_chat_id,
         topic_id,
         reason: str | None = None,
+        userbot: TelegramClient | None = None,
     ) -> int | None:
         try:
-            link = await self.build_source_link(source_chat_id, msg_id)
+            link = await self.build_source_link(source_chat_id, msg_id, userbot=userbot)
             reason_suffix = f"（{reason}）" if reason else ""
             text = f"⚠️ 无法转发的消息{reason_suffix}: {link}\n#fail2forward"
             result = await self.bot.send_message(
@@ -608,12 +631,13 @@ class Forwarder:
             logger.error("发送失败标记异常: msg=%s err=%s", msg_id, e)
             return None
 
-    async def _download_album_media(self, media_msgs: list[Message], tmpdir: str):
+    async def _download_album_media(self, media_msgs: list[Message], tmpdir: str,
+                                    userbot: TelegramClient | None = None):
         sem = asyncio.Semaphore(self.album_download_concurrency)
 
         async def _download_one(index: int, message: Message):
             async with sem:
-                path = await self.media.download_media_to_path(message, tmpdir)
+                path = await self.media.download_media_to_path(message, tmpdir, userbot=userbot)
                 return index, message, path
 
         tasks = [

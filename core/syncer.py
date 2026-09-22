@@ -21,8 +21,8 @@ logger = logging.getLogger("tg_forward_bot.syncer")
 
 class Syncer(ForwardingComponent):
     def __init__(self, bot: TelegramClient, userbot: TelegramClient,
-                 db: Database, config: dict):
-        super().__init__(bot, userbot, db, config)
+                 db: Database, config: dict, userbot_manager=None):
+        super().__init__(bot, userbot, db, config, userbot_manager=userbot_manager)
 
     async def _collect_messages(
         self,
@@ -31,10 +31,12 @@ class Syncer(ForwardingComponent):
         source_topic_id: int | None,
         offset_id: int,
         notify: Callable[[str], Awaitable[None]],
+        userbot: TelegramClient | None = None,
     ) -> list | None:
+        ub = userbot or self.userbot
         all_msgs = []
         try:
-            async for msg in self.userbot.iter_messages(
+            async for msg in ub.iter_messages(
                 source_chat_id,
                 reverse=True,
                 offset_id=offset_id,
@@ -64,12 +66,13 @@ class Syncer(ForwardingComponent):
         target_topic_id: int | None,
         unit_kind: str,
         source_ids: list[int],
+        userbot: TelegramClient | None = None,
     ) -> tuple[int, int, list[int]]:
         """转发普通消息单元，返回 (msg_count, last_msg_id, target_ids)。"""
         if unit_kind == "album":
             target_ids = await self.forwarder.forward_album(
                 source_chat_id, source_ids, target_chat_id, mode, target_topic_id,
-                caller="syncer"
+                caller="syncer", userbot=userbot
             )
             for src_id, tgt_id in zip(source_ids, target_ids):
                 await models.save_message_map(self.db, task_id, src_id, tgt_id)
@@ -78,7 +81,7 @@ class Syncer(ForwardingComponent):
         source_msg_id = source_ids[0]
         target_msg_id = await self.forwarder.forward_message(
             source_chat_id, source_msg_id, target_chat_id, mode, target_topic_id,
-            caller="syncer"
+            caller="syncer", userbot=userbot
         )
         if target_msg_id:
             await models.save_message_map(self.db, task_id, source_msg_id, target_msg_id)
@@ -90,11 +93,13 @@ class Syncer(ForwardingComponent):
         source_chat_id: int,
         all_msgs: list,
         units: list[tuple[str, list[int]]],
+        userbot: TelegramClient | None = None,
     ) -> tuple[dict[int, tuple[bool, str]], int]:
         """预检查每个转发单元是否受限，返回缓存与受限消息总数。"""
+        ub = userbot or self.userbot
         chat_globally_restricted = False
         try:
-            entity = await self.userbot.get_entity(source_chat_id)
+            entity = await ub.get_entity(source_chat_id)
             chat_globally_restricted = is_chat_globally_restricted(entity)
         except Exception:
             chat_globally_restricted = False
@@ -118,9 +123,10 @@ class Syncer(ForwardingComponent):
     # Takeout 内联转发受限消息
     # ------------------------------------------------------------------
 
-    async def _open_takeout(self):
+    async def _open_takeout(self, userbot: TelegramClient | None = None):
         """懒加载开启 Takeout 会话。"""
-        takeout = self.userbot.takeout()
+        ub = userbot or self.userbot
+        takeout = ub.takeout()
         return await takeout.__aenter__()
 
     @staticmethod
@@ -191,9 +197,14 @@ class Syncer(ForwardingComponent):
                          target_topic_id: int | None = None,
                          notify_chat_id: int | None = None,
                          notify_topic_id: int | None = None,
-                         notify_reply_to_msg_id: int | None = None):
+                         notify_reply_to_msg_id: int | None = None,
+                         userbot: TelegramClient | None = None):
         """执行历史同步任务。"""
         self._cancel_flags[task_id] = False
+        active_userbot = await self.get_active_userbot(source_chat_id, userbot)
+        phone = getattr(active_userbot, "_phone", "default")
+        logger.info("同步任务 #%s 选定 UserBot [%s] 执行", task_id, phone)
+
         task = await models.get_task(self.db, task_id)
         offset_id = task["last_synced_msg_id"] if task else 0
 
@@ -213,7 +224,8 @@ class Syncer(ForwardingComponent):
         takeout = None
 
         all_msgs = await self._collect_messages(
-            task_id, source_chat_id, source_topic_id, offset_id, _notify
+            task_id, source_chat_id, source_topic_id, offset_id, _notify,
+            userbot=active_userbot
         )
         if all_msgs is None:
             return
@@ -232,10 +244,10 @@ class Syncer(ForwardingComponent):
         logger.info("同步任务 #%s 共获取 %d 条消息", task_id, total)
         units = build_forward_units(all_msgs)
         restriction_cache, restricted_messages = await self._precheck_restricted_units(
-            source_chat_id, all_msgs, units
+            source_chat_id, all_msgs, units, userbot=active_userbot
         )
         await _notify(
-            f"📋 开始同步，共 {total} 条消息"
+            f"📊 扫描完成，共 {total} 条消息"
             f"\n• 受限消息: {restricted_messages} 条（将通过 Takeout 转发）"
             f"\n• 普通消息: {max(total - restricted_messages, 0)} 条"
         )
@@ -255,7 +267,7 @@ class Syncer(ForwardingComponent):
                     # 懒加载 Takeout
                     if takeout is None:
                         try:
-                            takeout = await self._open_takeout()
+                            takeout = await self._open_takeout(active_userbot)
                         except Exception as e:
                             logger.error("同步任务 #%s Takeout 开启失败: %s", task_id, e)
                             # 降级为跳过
@@ -290,6 +302,7 @@ class Syncer(ForwardingComponent):
                         target_topic_id=target_topic_id,
                         unit_kind=kind,
                         source_ids=source_ids,
+                        userbot=active_userbot,
                     )
                     await models.update_last_synced(self.db, task_id, last_msg_id)
                     total_forwarded += msg_count

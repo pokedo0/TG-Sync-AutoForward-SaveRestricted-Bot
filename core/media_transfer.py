@@ -120,18 +120,20 @@ class MediaTransferHelper:
             ext = ".mp4" if self.is_video_message(msg) else ".bin"
         return os.path.join(tmpdir, f"{msg.id}{ext}")
 
-    async def download_media_to_path(self, msg: Message, tmpdir: str) -> str | None:
+    async def download_media_to_path(self, msg: Message, tmpdir: str,
+                                     userbot: TelegramClient | None = None) -> str | None:
         path = self.build_download_target_path(msg, tmpdir)
-        return await self._download_media_with_compat(msg, file=path)
+        return await self._download_media_with_compat(msg, file=path, userbot=userbot)
 
-    async def download_video_thumb_to_path(self, msg: Message, tmpdir: str) -> str | None:
+    async def download_video_thumb_to_path(self, msg: Message, tmpdir: str,
+                                           userbot: TelegramClient | None = None) -> str | None:
         if not self.is_video_message(msg):
             return None
         cover = self._get_message_video_cover(msg)
         if cover:
             cover_base = os.path.join(tmpdir, f"{msg.id}_cover")
             try:
-                return await self._download_media_with_compat(cover, file=cover_base)
+                return await self._download_media_with_compat(cover, file=cover_base, userbot=userbot)
             except Exception:
                 pass
 
@@ -140,17 +142,18 @@ class MediaTransferHelper:
 
         thumb_base = os.path.join(tmpdir, f"{msg.id}_thumb")
         try:
-            return await self._download_media_with_compat(msg, file=thumb_base, thumb=-1)
+            return await self._download_media_with_compat(msg, file=thumb_base, thumb=-1, userbot=userbot)
         except TypeError:
             return None
 
-    async def _download_media_with_compat(self, media, **kwargs):
+    async def _download_media_with_compat(self, media, userbot: TelegramClient | None = None, **kwargs):
+        ub = userbot or self.userbot
         try:
-            return await self.userbot.download_media(
+            return await ub.download_media(
                 media, part_size_kb=self.download_part_size_kb, **kwargs
             )
         except TypeError:
-            return await self.userbot.download_media(media, **kwargs)
+            return await ub.download_media(media, **kwargs)
 
     async def send_file_with_compat(self, target_chat_id: int, file, **kwargs):
         try:

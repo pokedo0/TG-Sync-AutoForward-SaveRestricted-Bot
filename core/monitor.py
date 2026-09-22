@@ -15,13 +15,15 @@ logger = logging.getLogger("tg_forward_bot.monitor")
 
 class MonitorManager(ForwardingComponent):
     def __init__(self, bot: TelegramClient, userbot: TelegramClient,
-                 db: Database, config: dict):
-        super().__init__(bot, userbot, db, config)
-        self._handlers: dict[int, callable] = {}
+                 db: Database, config: dict,
+                 userbot_manager=None):
+        super().__init__(bot, userbot, db, config, userbot_manager=userbot_manager)
+        self._handlers: dict[int, tuple[callable, TelegramClient]] = {}
         self._album_buffers: dict[tuple[int, int], dict] = {}
 
     def _new_album_buffer(self, source_chat_id: int, target_chat_id: int,
-                          mode: str, target_topic_id: int | None) -> dict:
+                          mode: str, target_topic_id: int | None,
+                          userbot: TelegramClient | None = None) -> dict:
         return {
             "msgs": [],
             "flush_task": None,
@@ -29,6 +31,7 @@ class MonitorManager(ForwardingComponent):
             "target_chat_id": target_chat_id,
             "mode": mode,
             "target_topic_id": target_topic_id,
+            "userbot": userbot,
         }
 
     @staticmethod
@@ -62,10 +65,11 @@ class MonitorManager(ForwardingComponent):
 
     async def _forward_and_save(self, task_id: int, source_chat_id: int, source_msg_id: int,
                                 target_chat_id: int, mode: str,
-                                target_topic_id: int | None):
+                                target_topic_id: int | None,
+                                userbot: TelegramClient | None = None):
         target_msg_id = await self.forwarder.forward_message(
             source_chat_id, source_msg_id, target_chat_id, mode, target_topic_id,
-            caller="monitor")
+            caller="monitor", userbot=userbot)
         if target_msg_id:
             await models.save_message_map(self.db, task_id, source_msg_id, target_msg_id)
 
@@ -80,9 +84,10 @@ class MonitorManager(ForwardingComponent):
         target_chat_id = buffer["target_chat_id"]
         mode = buffer["mode"]
         target_topic_id = buffer["target_topic_id"]
+        ub = buffer.get("userbot")
 
         restricted, restricted_field = await self.forwarder.detect_restriction(
-            source_chat_id, msg_ids[0]
+            source_chat_id, msg_ids[0], userbot=ub
         )
         if restricted:
             logger.info(
@@ -95,6 +100,7 @@ class MonitorManager(ForwardingComponent):
                 target_chat_id=target_chat_id,
                 topic_id=target_topic_id,
                 reason=f"受限: {restricted_field}",
+                userbot=ub,
             )
             return
 
@@ -102,15 +108,18 @@ class MonitorManager(ForwardingComponent):
                     task_id, grouped_id, len(msg_ids))
         target_msg_ids = await self.forwarder.forward_album(
             source_chat_id, msg_ids, target_chat_id, mode, target_topic_id,
-            caller="monitor")
+            caller="monitor", userbot=ub)
         for src_id, tgt_id in zip(msg_ids, target_msg_ids):
             await models.save_message_map(self.db, task_id, src_id, tgt_id)
 
     async def start_monitor(self, task_id: int, source_chat_id: int,
                             target_chat_id: int, mode: str = "copy",
                             source_topic_id: int | None = None,
-                            target_topic_id: int | None = None):
+                            target_topic_id: int | None = None,
+                            userbot: TelegramClient | None = None):
         """启动一个监控任务。"""
+        active_userbot = await self.get_active_userbot(source_chat_id, userbot)
+
         async def handler(event):
             # 跳过系统消息
             if isinstance(event.message, MessageService):
@@ -123,7 +132,7 @@ class MonitorManager(ForwardingComponent):
                         task_id, source_chat_id, event.message.id)
             try:
                 restricted, restricted_field = await self.forwarder.detect_restriction(
-                    source_chat_id, event.message.id
+                    source_chat_id, event.message.id, userbot=active_userbot
                 )
                 if restricted:
                     logger.info(
@@ -136,6 +145,7 @@ class MonitorManager(ForwardingComponent):
                         target_chat_id=target_chat_id,
                         topic_id=target_topic_id,
                         reason=f"受限: {restricted_field}",
+                        userbot=active_userbot,
                     )
                     return
 
@@ -145,7 +155,8 @@ class MonitorManager(ForwardingComponent):
                     buffer = self._album_buffers.get(key)
                     if not buffer:
                         buffer = self._new_album_buffer(
-                            source_chat_id, target_chat_id, mode, target_topic_id)
+                            source_chat_id, target_chat_id, mode, target_topic_id,
+                            userbot=active_userbot)
                         self._album_buffers[key] = buffer
                     if all(m.id != event.message.id for m in buffer["msgs"]):
                         buffer["msgs"].append(event.message)
@@ -165,12 +176,13 @@ class MonitorManager(ForwardingComponent):
 
                 await self._forward_and_save(
                     task_id, source_chat_id, event.message.id,
-                    target_chat_id, mode, target_topic_id)
+                    target_chat_id, mode, target_topic_id,
+                    userbot=active_userbot)
             except (errors.ChannelPrivateError, errors.ChatAdminRequiredError) as e:
                 logger.error("监控 #%s 源不可访问: %s，标记为失败", task_id, type(e).__name__)
                 await models.update_task_status(self.db, task_id, "failed")
                 self._handlers.pop(task_id, None)
-                self.userbot.remove_event_handler(handler)
+                active_userbot.remove_event_handler(handler)
                 try:
                     await self.bot.send_message(
                         target_chat_id,
@@ -181,15 +193,18 @@ class MonitorManager(ForwardingComponent):
             except Exception as e:
                 logger.warning("监控 #%s 转发异常: %s", task_id, e)
 
-        self.userbot.add_event_handler(
+        active_userbot.add_event_handler(
             handler, events.NewMessage(chats=source_chat_id))
-        self._handlers[task_id] = handler
-        logger.info("监控任务 #%s 已注册: source=%s topic=%s", task_id, source_chat_id, source_topic_id)
+        self._handlers[task_id] = (handler, active_userbot)
+        phone = getattr(active_userbot, "_phone", "default")
+        logger.info("监控任务 #%s 已注册在 UserBot [%s]: source=%s topic=%s",
+                    task_id, phone, source_chat_id, source_topic_id)
 
     async def stop_monitor(self, task_id: int):
-        handler = self._handlers.pop(task_id, None)
-        if handler:
-            self.userbot.remove_event_handler(handler)
+        entry = self._handlers.pop(task_id, None)
+        if entry:
+            handler, client = entry
+            client.remove_event_handler(handler)
         keys = [k for k in self._album_buffers if k[0] == task_id]
         for key in keys:
             buf = self._album_buffers.pop(key, None)
@@ -213,3 +228,4 @@ class MonitorManager(ForwardingComponent):
                 restored += 1
         if restored:
             logger.info("已恢复 %d 个监控任务", restored)
+

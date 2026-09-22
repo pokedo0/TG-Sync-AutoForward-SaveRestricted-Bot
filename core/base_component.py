@@ -1,8 +1,14 @@
 """核心组件基类：统一注入 bot/userbot/db/config，提供共享方法。"""
+from __future__ import annotations
+
 import logging
 from collections.abc import Awaitable, Callable
 
 from telethon import TelegramClient, errors
+
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from core.userbot_manager import UserBotManager
 
 from core.rate_limiter import RateLimiter
 from core.runtime_context import build_forward_runtime
@@ -19,13 +25,27 @@ class SyncComponentBase:
         userbot: TelegramClient,
         db: Database,
         config: dict,
+        userbot_manager: UserBotManager | None = None,
     ) -> None:
         self.bot = bot
         self.userbot = userbot
         self.db = db
         self.config = config
+        self.userbot_manager = userbot_manager
         self.rl = RateLimiter(config)
         self._cancel_flags: dict[int, bool] = {}
+
+    async def get_active_userbot(
+        self, source_chat_id: int, userbot: TelegramClient | None = None
+    ) -> TelegramClient:
+        """获取适用于该 source_chat_id 的 UserBot 客户端。"""
+        if userbot:
+            return userbot
+        if self.userbot_manager:
+            client, _ = await self.userbot_manager.resolve_accessible_userbot(source_chat_id)
+            if client:
+                return client
+        return self.userbot
 
     def cancel(self, task_id: int) -> None:
         self._cancel_flags[task_id] = True
@@ -117,8 +137,9 @@ class ForwardingComponent(SyncComponentBase):
         userbot: TelegramClient,
         db: Database,
         config: dict,
+        userbot_manager: UserBotManager | None = None,
     ) -> None:
-        super().__init__(bot, userbot, db, config)
+        super().__init__(bot, userbot, db, config, userbot_manager=userbot_manager)
         runtime = build_forward_runtime(bot, userbot, config)
         self.rl = runtime.rl
         self.forwarder = runtime.forwarder
