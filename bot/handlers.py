@@ -108,6 +108,12 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
     # 内部共享 helpers
     # ------------------------------------------------------------------
 
+    async def _resolve_chat_id_connected(parsed: ParsedLink) -> int | None:
+        """解析链接对应的 chat_id；需要网络查询时先确保主 UserBot 已连接。"""
+        if userbot_manager and not isinstance(parsed.chat_id, int):
+            await userbot_manager.ensure_connected(userbot)
+        return await resolve_chat_id(userbot, parsed)
+
     async def _parse_source(event) -> ParsedSource | None:
         """从命令消息中解析链接并返回 ParsedSource。"""
         text = event.raw_text
@@ -120,7 +126,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         if not parsed:
             await event.reply("❌ 无法解析链接")
             return None
-        source_id = await resolve_chat_id(userbot, parsed)
+        source_id = await _resolve_chat_id_connected(parsed)
         if not source_id:
             await event.reply("❌ 无法访问源频道/群组")
             return None
@@ -353,6 +359,8 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
         target_msg_id = parsed.msg_id
         ub = client or userbot
         if parsed.comment_id:
+            if userbot_manager:
+                await userbot_manager.ensure_connected(ub)
             linked_id = await resolve_linked_chat(ub, source_id)
             if not linked_id:
                 return None
@@ -549,7 +557,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             await event.reply("❌ 无法解析链接，需要包含消息ID")
             return None
 
-        source_id = await resolve_chat_id(userbot, parsed)
+        source_id = await _resolve_chat_id_connected(parsed)
         if not source_id:
             await event.reply("❌ 无法访问该频道/群组")
             return None
@@ -749,7 +757,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient,
             await event.reply("❌ 无法解析链接，链接中必须包含消息 ID")
             return
 
-        source_id = await resolve_chat_id(userbot, parsed)
+        source_id = await _resolve_chat_id_connected(parsed)
         if not source_id:
             await event.reply("❌ 无法访问源频道/群组")
             return

@@ -10,3 +10,22 @@ config.yaml
 reports/
 /reports/
 *.jsonl
+
+# 虚拟环境与 Python 缓存
+venv/
+.venv/
+
+# 数据库与日志
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# IDE / 工具缓存与临时目录
+.idea/
+.vscode/
+.pytest_cache/
+.ruff_cache/
+.uv-cache/
+.tmp/
+.codegraph/
